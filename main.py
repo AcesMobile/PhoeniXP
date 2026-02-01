@@ -92,7 +92,7 @@ def clamp_xp(xp):
     return max(0, min(MAX_XP, xp))
 
 def rank_from_xp(xp):
-    if xp < MAX_XP * 0.2:
+    if xp < MAX_XP * 0.01:
         return ROLE_NAMES[0]
     if xp < MAX_XP * 0.4:
         return ROLE_NAMES[1]
