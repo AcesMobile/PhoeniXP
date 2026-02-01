@@ -287,19 +287,47 @@ async def balance(interaction: discord.Interaction):
 
 @bot.tree.command(name="leaderboard")
 async def leaderboard(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True)
+
+    # Build a complete member map (not cache-dependent)
+    members = {}
+    async for m in guild.fetch_members(limit=None):
+        members[m.id] = m
+
+    # Ensure EVERY member has a DB row (so nobody is missing)
     with db() as conn:
+        for uid in members.keys():
+            get_user(conn, guild.id, uid)
+
         rows = conn.execute(
-            "SELECT user_id, xp FROM users WHERE guild_id=? ORDER BY xp DESC LIMIT 10",
-            (interaction.guild.id,)
+            "SELECT user_id, xp FROM users WHERE guild_id=? ORDER BY xp DESC, user_id ASC",
+            (guild.id,)
         ).fetchall()
 
-    msg = ""
+    lines = []
     for i, r in enumerate(rows, start=1):
-        member = interaction.guild.get_member(r["user_id"])
-        name = member.display_name if member else "User"
-        msg += f"{i}. **{name}** — {r['xp']}\n"
+        uid = r["user_id"]
+        xp = r["xp"]
+        m = members.get(uid)
+        name = m.display_name if m else f"User {uid}"
+        rank = rank_from_xp(xp)
+        lines.append(f"{i:>4}. {name} — {xp} XP — {rank}")
 
-    await interaction.response.send_message(msg or "No data yet.", ephemeral=True)
+    # If huge, send as file
+    content = "\n".join(lines) if lines else "No users yet."
+    data = content.encode("utf-8")
+    file = discord.File(fp=io.BytesIO(data), filename="leaderboard.txt")
+
+    await interaction.followup.send(
+        "✅ Full leaderboard (everyone + rank):",
+        file=file,
+        ephemeral=True
+    )
+
 
 @bot.tree.command(name="audit")
 @app_commands.describe(days="How many days back to scan (default 30)")
