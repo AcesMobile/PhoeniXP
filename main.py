@@ -510,6 +510,98 @@ async def audit(interaction: discord.Interaction, days: int = 30):
     )
 
 
+@bot.tree.command(name="audit")
+@app_commands.describe(days="How many days back to scan (default 30)")
+async def audit(interaction: discord.Interaction, days: int = 30):
+    if not interaction.guild:
+        return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+    # Optional: lock to admins
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    await interaction.response.send_message(
+        f"Auditing last **{days}** day(s) of chat…",
+        ephemeral=True
+    )
+
+    guild = interaction.guild
+    cutoff_dt = datetime.utcnow() - timedelta(days=days)
+
+    scanned = 0
+    awarded_total = 0
+    per_user = {}  # user_id -> gained xp
+
+    for channel in guild.text_channels:
+        perms = channel.permissions_for(guild.me)
+        if not (perms.read_messages and perms.read_message_history):
+            continue
+
+        try:
+            async for msg in channel.history(after=cutoff_dt, oldest_first=True, limit=None):
+                scanned += 1
+
+                if msg.author.bot:
+                    continue
+
+                content = (msg.content or "").strip()
+                if len(content) < MIN_MESSAGE_CHARS:
+                    continue
+
+                ts = int(msg.created_at.timestamp())
+
+                with db() as conn:
+                    user = get_user(conn, guild.id, msg.author.id)
+
+                    # cooldown check based on message time (historical)
+                    if ts < user["chat_cooldown"]:
+                        continue
+
+                    awarded = try_award_xp_at(conn, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
+
+                    # set cooldown relative to message time (historical)
+                    conn.execute(
+                        "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                        (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id)
+                    )
+                    conn.commit()
+
+                if awarded:
+                    awarded_total += awarded
+                    per_user[msg.author.id] = per_user.get(msg.author.id, 0) + awarded
+
+        except Exception:
+            # some channels may fail history() due to perms/age/etc
+            continue
+
+    # apply roles after audit
+    updated = 0
+    for user_id, gained in per_user.items():
+        member = guild.get_member(user_id)
+        if not member:
+            continue
+        with db() as conn:
+            xp = get_user(conn, guild.id, user_id)["xp"]
+        await sync_role(member, xp)
+        updated += 1
+
+    top = sorted(per_user.items(), key=lambda x: x[1], reverse=True)[:10]
+    lines = []
+    for i, (uid, gained) in enumerate(top, start=1):
+        m = guild.get_member(uid)
+        name = m.display_name if m else f"User {uid}"
+        lines.append(f"{i}. **{name}** +{gained} XP")
+
+    await interaction.followup.send(
+        "✅ **Audit complete**\n"
+        f"Scanned messages: **{scanned}**\n"
+        f"Users updated: **{updated}**\n"
+        f"Total XP awarded: **{awarded_total}**\n\n"
+        "**Top gains**\n" + ("\n".join(lines) if lines else "No awards in this window."),
+        ephemeral=True
+    )
+
+
 # =========================
 # RUN
 # =========================
