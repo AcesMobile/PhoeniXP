@@ -270,3 +270,10 @@ async def leaderboard(interaction: discord.Interaction):
 # RUN
 # =========================
 bot.run(os.getenv("DISCORD_TOKEN"))
+
+token = os.getenv("DISCORD_TOKEN")
+print("DISCORD_TOKEN present?", bool(token), "len=", len(token) if token else 0)
+if not token:
+    raise RuntimeError("DISCORD_TOKEN missing in Railway environment")
+bot.run(token)
+
