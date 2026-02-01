@@ -176,7 +176,50 @@ async def sync_all_roles(guild: discord.Guild) -> tuple[int, int]:
     return updated, failed
 
 def display_rank(m: discord.Member, computed: str) -> str:
+    # show Prime in output, but never auto-manage it
     return f"{MANUAL_PRIME_ROLE} + {computed}" if has_prime(m) else computed
+
+# -------------------------
+# RESET LOGIC
+# -------------------------
+def compute_reset_xp(old_xp: int) -> int:
+    """
+    Reset rule:
+    - if old < 3, keep it (0,1,2 stay 0,1,2)
+    - else set to 3 (Operative floor)
+    """
+    return int(old_xp) if int(old_xp) < INITIATE_EXIT_XP else INITIATE_EXIT_XP
+
+async def reset_ranks_for_members(guild: discord.Guild, member_ids: list[int]) -> tuple[int, int]:
+    """
+    Applies reset-xp rule to selected members, then re-syncs roles for everyone (top-X depends on whole ladder).
+    Returns (changed_xp_count, role_updated_ok_minus_failed) is not tracked here; resync returns (ok, failed).
+    """
+    changed = 0
+    with db() as c:
+        for uid in member_ids:
+            u = get_user(c, guild.id, uid)
+            old_xp = int(u["xp"])
+            new_xp = compute_reset_xp(old_xp)
+            if new_xp != old_xp:
+                c.execute("UPDATE users SET xp=?, last_active=?, chat_cooldown=?, last_minute=?, earned_this_minute=? WHERE guild_id=? AND user_id=?",
+                          (new_xp, 0, 0, 0, 0, guild.id, uid))
+                changed += 1
+            else:
+                # still wipe cooldown/minute state so they aren't "stuck"
+                c.execute("UPDATE users SET last_active=?, chat_cooldown=?, last_minute=?, earned_this_minute=? WHERE guild_id=? AND user_id=?",
+                          (0, 0, 0, 0, guild.id, uid))
+        c.commit()
+
+    ok, failed = await sync_all_roles(guild)
+    return changed, (ok, failed)
+
+async def fetch_nonbot_members(guild: discord.Guild) -> dict[int, discord.Member]:
+    members: dict[int, discord.Member] = {}
+    async for m in guild.fetch_members(limit=None):
+        if not m.bot:
+            members[m.id] = m
+    return members
 
 # -------------------------
 # EVENTS
@@ -247,6 +290,7 @@ async def decay_loop():
                 loss = max(int(xp * DECAY_PERCENT_PER_DAY), DECAY_MIN_XP_PER_DAY)
                 new_xp = clamp_xp(xp - loss)
 
+                # decay floor applies only once they have reached 3+
                 if xp >= DECAY_FLOOR_XP:
                     new_xp = max(DECAY_FLOOR_XP, new_xp)
 
@@ -269,10 +313,7 @@ async def leaderboard(interaction: discord.Interaction):
     guild = interaction.guild
     await interaction.response.defer(ephemeral=True)
 
-    members: dict[int, discord.Member] = {}
-    async for m in guild.fetch_members(limit=None):
-        if not m.bot:
-            members[m.id] = m
+    members = await fetch_nonbot_members(guild)
 
     with db() as c:
         for uid in members.keys():
@@ -293,11 +334,29 @@ async def leaderboard(interaction: discord.Interaction):
         place += 1
         m = members[uid]
         xp = int(r["xp"])
-        lines.append(f"{place:>4}. {m.display_name} — {xp} XP — {display_rank(m, rank_map.get(uid, ROLE_INITIATE))}")
+        lines.append(
+            f"{place:>4}. {m.display_name} — {xp} XP — {display_rank(m, rank_map.get(uid, ROLE_INITIATE))}"
+        )
 
-    file = discord.File(fp=io.BytesIO(("\n".join(lines) if lines else "No users.").encode("utf-8")),
-                        filename="leaderboard.txt")
-    await interaction.followup.send("✅ Full leaderboard:", file=file, ephemeral=True)
+    # send text in chat (ephemeral) + txt file (also ephemeral)
+    text_preview = "\n".join(lines[:30]) if lines else "No users."
+    if len(lines) > 30:
+        text_preview += f"\n… and **{len(lines)-30}** more (see file)"
+
+    file = discord.File(
+        fp=io.BytesIO(("\n".join(lines) if lines else "No users.").encode("utf-8")),
+        filename="leaderboard.txt"
+    )
+
+    await interaction.followup.send(
+        "✅ **Leaderboard**\n" + text_preview,
+        ephemeral=True
+    )
+    await interaction.followup.send(
+        "📎 Full leaderboard file:",
+        file=file,
+        ephemeral=True
+    )
 
 @bot.tree.command(name="audit")
 @app_commands.describe(days="How many days back to scan (default 30)")
@@ -311,11 +370,7 @@ async def audit(interaction: discord.Interaction, days: int = 30):
     cutoff_dt = datetime.utcnow() - timedelta(days=days)
     await interaction.response.defer(ephemeral=True)
 
-    # gather members
-    members: dict[int, discord.Member] = {}
-    async for m in guild.fetch_members(limit=None):
-        if not m.bot:
-            members[m.id] = m
+    members = await fetch_nonbot_members(guild)
 
     with db() as c:
         for uid in members.keys():
@@ -328,7 +383,12 @@ async def audit(interaction: discord.Interaction, days: int = 30):
         """, (guild.id,))
         c.commit()
 
-    scanned = awarded_total = skipped = 0
+    scanned = 0
+    awarded_total = 0
+    skipped_channels = 0
+    skipped_msgs_short = 0
+    skipped_msgs_bots = 0
+    per_user: dict[int, int] = {}
 
     for ch in guild.text_channels:
         me = guild.me
@@ -336,16 +396,20 @@ async def audit(interaction: discord.Interaction, days: int = 30):
             continue
         perms = ch.permissions_for(me)
         if not (perms.view_channel and perms.read_message_history):
-            skipped += 1
+            skipped_channels += 1
             continue
 
         try:
             async for msg in ch.history(after=cutoff_dt, oldest_first=True, limit=None):
                 scanned += 1
+
                 if msg.author.bot:
+                    skipped_msgs_bots += 1
                     continue
+
                 content = (msg.content or "").strip()
                 if len(content) < MIN_MESSAGE_CHARS:
+                    skipped_msgs_short += 1
                     continue
 
                 ts = int(msg.created_at.timestamp())
@@ -355,27 +419,58 @@ async def audit(interaction: discord.Interaction, days: int = 30):
                         continue
 
                     gained = award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts=ts)
+                    if gained:
+                        per_user[msg.author.id] = per_user.get(msg.author.id, 0) + gained
                     c.execute("UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
                               (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id))
                     c.commit()
 
                 awarded_total += gained
         except Exception:
-            skipped += 1
+            skipped_channels += 1
 
-    updated, failed = await sync_all_roles(guild,)
+    ok, failed = await sync_all_roles(guild)
+
+    # top gains
+    top = sorted(per_user.items(), key=lambda x: (-x[1], x[0]))[:10]
+    top_lines = []
+    for i, (uid, gained) in enumerate(top, start=1):
+        name = members[uid].display_name if uid in members else str(uid)
+        top_lines.append(f"{i}. {name} +{gained} XP")
+
+    # file report
+    report = [
+        f"Audit window: last {days} day(s)",
+        f"Cutoff (UTC): {cutoff_dt.isoformat()}",
+        "",
+        f"Scanned messages: {scanned}",
+        f"XP awarded total: {awarded_total}",
+        f"Channels skipped (perms/errors): {skipped_channels}",
+        f"Msgs skipped (bots): {skipped_msgs_bots}",
+        f"Msgs skipped (too short): {skipped_msgs_short}",
+        "",
+        f"Role sync: ok={ok} failed={failed}",
+        "",
+        "Top gains:",
+        *(top_lines if top_lines else ["None"]),
+    ]
+    report_file = discord.File(fp=io.BytesIO("\n".join(report).encode("utf-8")), filename="audit_report.txt")
 
     await interaction.followup.send(
         "✅ **Audit complete**\n"
-        f"Scanned: **{scanned}** msgs\n"
-        f"Awarded: **{awarded_total}** XP\n"
-        f"Role sync: **{updated}** ok / **{failed}** failed\n"
-        f"Skipped channels: **{skipped}**",
+        f"- Scanned: **{scanned}** msgs\n"
+        f"- Awarded: **{awarded_total}** XP\n"
+        f"- Skipped channels: **{skipped_channels}**\n"
+        f"- Skipped msgs: **{skipped_msgs_bots}** bots, **{skipped_msgs_short}** too short\n"
+        f"- Role sync: **{ok}** ok / **{failed}** failed\n\n"
+        "**Top gains**\n" + ("\n".join(top_lines) if top_lines else "None"),
         ephemeral=True
     )
+    await interaction.followup.send("📎 Full audit report:", file=report_file, ephemeral=True)
 
 @bot.tree.command(name="resetranks")
-async def resetranks(interaction: discord.Interaction):
+@app_commands.describe(member="Optional: reset just one member (default: everyone)")
+async def resetranks(interaction: discord.Interaction, member: discord.Member | None = None):
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
     if not is_admin(interaction):
@@ -384,41 +479,25 @@ async def resetranks(interaction: discord.Interaction):
     guild = interaction.guild
     await interaction.response.defer(ephemeral=True)
 
-    members: dict[int, discord.Member] = {}
-    async for m in guild.fetch_members(limit=None):
-        if not m.bot:
-            members[m.id] = m
+    members = await fetch_nonbot_members(guild)
 
-    with db() as c:
-        for uid in members.keys():
-            get_user(c, guild.id, uid)
-        c.execute("""
-            UPDATE users
-            SET xp=0, last_active=0, chat_cooldown=0, last_minute=0, earned_this_minute=0
-            WHERE guild_id=?
-        """, (guild.id,))
-        c.commit()
+    if member is not None:
+        if member.bot:
+            return await interaction.followup.send("Can't reset a bot.", ephemeral=True)
+        target_ids = [member.id]
+        scope = f"one member: **{member.display_name}**"
+    else:
+        target_ids = list(members.keys())
+        scope = f"**everyone** ({len(target_ids)} users)"
 
-    roles = {r.name: r for r in guild.roles}
-    managed = [roles[n] for n in ROLE_NAMES if n in roles]
-    init_role = roles.get(ROLE_INITIATE)
-
-    updated = failed = 0
-    for m in members.values():
-        try:
-            to_remove = [r for r in managed if r in m.roles]
-            if to_remove:
-                await m.remove_roles(*to_remove, reason="Reset ranks")
-            if init_role and init_role not in m.roles:
-                await m.add_roles(init_role, reason="Reset ranks")
-            updated += 1
-        except Exception:
-            failed += 1
+    changed, (ok, failed) = await reset_ranks_for_members(guild, target_ids)
 
     await interaction.followup.send(
-        "✅ **Ranks reset**\n"
-        "- XP set to **0** for everyone\n"
-        f"- Bot roles reset to **{ROLE_INITIATE}** for **{updated}** users (failed **{failed}**)\n"
+        "✅ **Reset ranks complete**\n"
+        f"- Scope: {scope}\n"
+        f"- XP rule: `<3 stays`, `>=3 -> 3`\n"
+        f"- Users with XP changed: **{changed}**\n"
+        f"- Role sync: **{ok}** ok / **{failed}** failed\n"
         f"- `{MANUAL_PRIME_ROLE}` preserved (bot never touches it)",
         ephemeral=True
     )
