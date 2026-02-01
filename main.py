@@ -228,6 +228,7 @@ async def silent_startup_audit():
 
         await sync_all_roles(guild)
 
+
 # -------------------------
 # EVENTS
 # -------------------------
