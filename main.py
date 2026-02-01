@@ -183,7 +183,8 @@ def try_award_xp_at(conn, guild_id: int, user_id: int, amount: int, ts: int) -> 
 async def sync_role(member: discord.Member, xp: int):
     """
     Keeps bot-managed roles aligned with XP.
-    Does NOT touch Phoenix Prime (manual prestige role).
+    Does NOT remove Phoenix Prime (manual prestige role).
+    (Prime can coexist with XP-rank roles.)
     """
     target = rank_from_xp(xp)
     roles = {r.name: r for r in member.guild.roles}
@@ -204,14 +205,21 @@ async def sync_role(member: discord.Member, xp: int):
             await member.remove_roles(*to_remove, reason="XP rank sync")
         if to_add not in member.roles:
             await member.add_roles(to_add, reason="XP rank sync")
-    except:
+    except Exception:
         pass
 
 def display_rank(member: discord.Member, xp: int) -> str:
-    # If they have manual Prime, show that in outputs, but bot still only manages Ascendant and below.
-    if any(r.name == MANUAL_PRIME_ROLE for r in member.roles):
-        return MANUAL_PRIME_ROLE
-    return rank_from_xp(xp)
+    """
+    What we SHOW in commands:
+    - Always compute XP-rank.
+    - If they have Phoenix Prime, show it as a prestige overlay too.
+      Example: "Phoenix Prime + Ascendant"
+    """
+    xp_rank = rank_from_xp(xp)
+    has_prime = any(r.name == MANUAL_PRIME_ROLE for r in member.roles)
+    if has_prime:
+        return f"{MANUAL_PRIME_ROLE} + {xp_rank}"
+    return xp_rank
 
 # =========================
 # EVENTS
@@ -485,7 +493,7 @@ async def audit(interaction: discord.Interaction, days: int = 30):
         elif isinstance(ch, discord.ForumChannel):
             await scan_forum_channel(ch)
 
-    # Sync roles for EVERY member (Prime unaffected)
+    # Sync roles for EVERY member (Prime unaffected; XP-rank roles still set)
     updated = 0
     for uid, member in members.items():
         with db() as conn:
