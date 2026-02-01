@@ -2,7 +2,7 @@ import os
 import math
 import time
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
@@ -133,6 +133,41 @@ def try_award_xp(conn, guild_id, user_id, amount):
     conn.commit()
 
     return award
+
+def try_award_xp_at(conn, guild_id, user_id, amount, ts: int):
+    """
+    Same logic as try_award_xp, but uses a provided timestamp (ts)
+    so audit/backfill respects historical cooldown + per-minute cap.
+    """
+    user = get_user(conn, guild_id, user_id)
+    bucket = minute_bucket(ts)
+
+    earned = user["earned_this_minute"]
+    if bucket != user["last_minute"]:
+        earned = 0
+
+    remaining = PER_MINUTE_XP_CAP - earned
+    award = max(0, min(amount, remaining))
+
+    new_xp = clamp_xp(user["xp"] + award)
+
+    conn.execute("""
+        UPDATE users
+        SET xp=?, last_active=?,
+            last_minute=?, earned_this_minute=?
+        WHERE guild_id=? AND user_id=?
+    """, (
+        new_xp,
+        ts if award > 0 else user["last_active"],
+        bucket,
+        earned + award,
+        guild_id,
+        user_id
+    ))
+    conn.commit()
+
+    return award
+
 
 async def sync_role(member, xp):
     target = rank_from_xp(xp)
@@ -265,6 +300,98 @@ async def leaderboard(interaction: discord.Interaction):
         msg += f"{i}. **{name}** — {r['xp']}\n"
 
     await interaction.response.send_message(msg or "No data yet.", ephemeral=True)
+
+@bot.tree.command(name="audit")
+@app_commands.describe(days="How many days back to scan (default 30)")
+async def audit(interaction: discord.Interaction, days: int = 30):
+    if not interaction.guild:
+        return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+    # Optional: lock to admins
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    await interaction.response.send_message(
+        f"Auditing last **{days}** day(s) of chat…",
+        ephemeral=True
+    )
+
+    guild = interaction.guild
+    cutoff_dt = datetime.utcnow() - timedelta(days=days)
+
+    scanned = 0
+    awarded_total = 0
+    per_user = {}  # user_id -> gained xp
+
+    for channel in guild.text_channels:
+        perms = channel.permissions_for(guild.me)
+        if not (perms.read_messages and perms.read_message_history):
+            continue
+
+        try:
+            async for msg in channel.history(after=cutoff_dt, oldest_first=True, limit=None):
+                scanned += 1
+
+                if msg.author.bot:
+                    continue
+
+                content = (msg.content or "").strip()
+                if len(content) < MIN_MESSAGE_CHARS:
+                    continue
+
+                ts = int(msg.created_at.timestamp())
+
+                with db() as conn:
+                    user = get_user(conn, guild.id, msg.author.id)
+
+                    # cooldown check based on message time (historical)
+                    if ts < user["chat_cooldown"]:
+                        continue
+
+                    awarded = try_award_xp_at(conn, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
+
+                    # set cooldown relative to message time (historical)
+                    conn.execute(
+                        "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                        (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id)
+                    )
+                    conn.commit()
+
+                if awarded:
+                    awarded_total += awarded
+                    per_user[msg.author.id] = per_user.get(msg.author.id, 0) + awarded
+
+        except Exception:
+            # some channels may fail history() due to perms/age/etc
+            continue
+
+    # apply roles after audit
+    updated = 0
+    for user_id, gained in per_user.items():
+        member = guild.get_member(user_id)
+        if not member:
+            continue
+        with db() as conn:
+            xp = get_user(conn, guild.id, user_id)["xp"]
+        await sync_role(member, xp)
+        updated += 1
+
+    top = sorted(per_user.items(), key=lambda x: x[1], reverse=True)[:10]
+    lines = []
+    for i, (uid, gained) in enumerate(top, start=1):
+        m = guild.get_member(uid)
+        name = m.display_name if m else f"User {uid}"
+        lines.append(f"{i}. **{name}** +{gained} XP")
+
+    await interaction.followup.send(
+        "✅ **Audit complete**\n"
+        f"Scanned messages: **{scanned}**\n"
+        f"Users updated: **{updated}**\n"
+        f"Total XP awarded: **{awarded_total}**\n\n"
+        "**Top gains**\n" + ("\n".join(lines) if lines else "No awards in this window."),
+        ephemeral=True
+    )
+
 
 # =========================
 # RUN
