@@ -2,6 +2,7 @@ import os
 import math
 import time
 import sqlite3
+import io
 from datetime import datetime, timedelta
 
 import discord
@@ -287,19 +288,227 @@ async def balance(interaction: discord.Interaction):
 
 @bot.tree.command(name="leaderboard")
 async def leaderboard(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True)
+
+    # Build a complete member map (not cache-dependent)
+    members = {}
+    async for m in guild.fetch_members(limit=None):
+        members[m.id] = m
+
+    # Ensure EVERY member has a DB row (so nobody is missing)
     with db() as conn:
+        for uid in members.keys():
+            get_user(conn, guild.id, uid)
+
         rows = conn.execute(
-            "SELECT user_id, xp FROM users WHERE guild_id=? ORDER BY xp DESC LIMIT 10",
-            (interaction.guild.id,)
+            "SELECT user_id, xp FROM users WHERE guild_id=? ORDER BY xp DESC, user_id ASC",
+            (guild.id,)
         ).fetchall()
 
-    msg = ""
+    lines = []
     for i, r in enumerate(rows, start=1):
-        member = interaction.guild.get_member(r["user_id"])
-        name = member.display_name if member else "User"
-        msg += f"{i}. **{name}** — {r['xp']}\n"
+        uid = r["user_id"]
+        xp = r["xp"]
+        m = members.get(uid)
+        name = m.display_name if m else f"User {uid}"
+        rank = rank_from_xp(xp)
+        lines.append(f"{i:>4}. {name} — {xp} XP — {rank}")
 
-    await interaction.response.send_message(msg or "No data yet.", ephemeral=True)
+    # If huge, send as file
+    content = "\n".join(lines) if lines else "No users yet."
+    data = content.encode("utf-8")
+    file = discord.File(fp=io.BytesIO(data), filename="leaderboard.txt")
+
+    await interaction.followup.send(
+        "✅ Full leaderboard (everyone + rank):",
+        file=file,
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="audit")
+@app_commands.describe(days="How many days back to scan (default 30)")
+async def audit(interaction: discord.Interaction, days: int = 30):
+    if not interaction.guild:
+        return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+    # Admin-only (optional)
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message("Admin only.", ephemeral=True)
+
+    guild = interaction.guild
+    cutoff_dt = datetime.utcnow() - timedelta(days=days)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # ---------- Helpers ----------
+    def can_read_history(ch: discord.abc.GuildChannel) -> bool:
+        me = guild.me
+        if not me:
+            return False
+        perms = ch.permissions_for(me)
+        return bool(perms.view_channel and perms.read_message_history)
+
+    async def scan_history(messageable, label: str):
+        nonlocal scanned, awarded_total, skipped_histories
+        if not can_read_history(messageable):
+            skipped_histories += 1
+            return
+
+        try:
+            async for msg in messageable.history(after=cutoff_dt, oldest_first=True, limit=None):
+                scanned += 1
+
+                if msg.author.bot:
+                    continue
+
+                content = (msg.content or "").strip()
+                if len(content) < MIN_MESSAGE_CHARS:
+                    continue
+
+                ts = int(msg.created_at.timestamp())
+
+                with db() as conn:
+                    user = get_user(conn, guild.id, msg.author.id)
+
+                    # Historical cooldown check
+                    if ts < user["chat_cooldown"]:
+                        continue
+
+                    awarded = try_award_xp_at(
+                        conn, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts
+                    )
+
+                    # Set cooldown relative to historical msg time
+                    conn.execute(
+                        "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                        (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id)
+                    )
+                    conn.commit()
+
+                if awarded:
+                    awarded_total += awarded
+                    per_user[msg.author.id] = per_user.get(msg.author.id, 0) + awarded
+
+        except Exception:
+            skipped_histories += 1
+            return
+
+    async def scan_threads_for_channel(ch: discord.TextChannel):
+        # active threads
+        for th in getattr(ch, "threads", []):
+            await scan_history(th, f"thread:{th.id}")
+
+        # archived public threads
+        try:
+            async for th in ch.archived_threads(limit=None, private=False):
+                await scan_history(th, f"archived_public_thread:{th.id}")
+        except Exception:
+            pass
+
+        # archived private threads (requires Manage Threads / permissions)
+        try:
+            async for th in ch.archived_threads(limit=None, private=True):
+                await scan_history(th, f"archived_private_thread:{th.id}")
+        except Exception:
+            pass
+
+    async def scan_forum_channel(forum: discord.ForumChannel):
+        # Active threads in forum
+        try:
+            for th in forum.threads:
+                await scan_history(th, f"forum_thread:{th.id}")
+        except Exception:
+            pass
+
+        # Archived threads in forum
+        try:
+            async for th in forum.archived_threads(limit=None, private=False):
+                await scan_history(th, f"forum_archived_public:{th.id}")
+        except Exception:
+            pass
+
+        try:
+            async for th in forum.archived_threads(limit=None, private=True):
+                await scan_history(th, f"forum_archived_private:{th.id}")
+        except Exception:
+            pass
+
+    # ---------- Audit run ----------
+    scanned = 0
+    awarded_total = 0
+    skipped_histories = 0
+    per_user = {}  # user_id -> gained xp
+
+    # Ensure EVERY member exists in DB, even if they have 0 XP / no qualifying messages
+    members = {}
+    async for m in guild.fetch_members(limit=None):
+        if not m.bot:
+            members[m.id] = m
+    with db() as conn:
+        for uid in members.keys():
+            get_user(conn, guild.id, uid)
+
+    # Scan all channels
+    for ch in guild.channels:
+        # Text channels
+        if isinstance(ch, discord.TextChannel):
+            await scan_history(ch, f"text:{ch.id}")
+            await scan_threads_for_channel(ch)
+
+        # Forum channels
+        elif isinstance(ch, discord.ForumChannel):
+            await scan_forum_channel(ch)
+
+        # You can add other channel types here if you want (news channels, etc.)
+
+    # Sync roles for EVERY member (not just those with gains)
+    updated = 0
+    for uid, member in members.items():
+        with db() as conn:
+            xp = get_user(conn, guild.id, uid)["xp"]
+        await sync_role(member, xp)
+        updated += 1
+
+    # Top gains
+    top = sorted(per_user.items(), key=lambda x: x[1], reverse=True)[:10]
+    lines = []
+    for i, (uid, gained) in enumerate(top, start=1):
+        m = members.get(uid)
+        name = m.display_name if m else f"User {uid}"
+        lines.append(f"{i}. **{name}** +{gained} XP")
+
+    # Make a full report file (optional, but useful for big audits)
+    report_lines = [
+        f"Audit window: last {days} day(s)",
+        f"Cutoff (UTC): {cutoff_dt.isoformat()}",
+        f"Scanned messages: {scanned}",
+        f"Users with gains: {len(per_user)}",
+        f"Users role-synced: {updated}",
+        f"Total XP awarded: {awarded_total}",
+        f"Histories skipped (perms/errors): {skipped_histories}",
+        "",
+        "Top gains:",
+        *(lines if lines else ["No awards in this window."]),
+    ]
+    report = "\n".join(report_lines).encode("utf-8")
+    file = discord.File(fp=io.BytesIO(report), filename="audit_report.txt")
+
+    await interaction.followup.send(
+        "✅ **Audit complete**\n"
+        f"Scanned messages: **{scanned}**\n"
+        f"Users role-synced: **{updated}**\n"
+        f"Total XP awarded: **{awarded_total}**\n"
+        f"Skipped histories: **{skipped_histories}**\n\n"
+        "**Top gains**\n" + ("\n".join(lines) if lines else "No awards in this window."),
+        file=file,
+        ephemeral=True
+    )
+
 
 @bot.tree.command(name="audit")
 @app_commands.describe(days="How many days back to scan (default 30)")
@@ -392,7 +601,7 @@ async def audit(interaction: discord.Interaction, days: int = 30):
         ephemeral=True
     )
 
-
+#
 # =========================
 # RUN
 # =========================
@@ -402,4 +611,3 @@ print("DISCORD_TOKEN present?", bool(token), "len=", len(token) if token else 0)
 if not token:
     raise RuntimeError("DISCORD_TOKEN missing in Railway environment")
 bot.run(token)
-
