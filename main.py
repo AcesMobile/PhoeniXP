@@ -1,4 +1,3 @@
-# main.py
 import os
 import time
 import sqlite3
@@ -25,13 +24,25 @@ DECAY_GRACE_HOURS = 72
 DECAY_PERCENT_PER_DAY = 0.01
 DECAY_MIN_XP_PER_DAY = 1
 
+# Bot-managed ranks ONLY (Prime is manual)
 ROLE_NAMES = [
     "Initiate",
     "Operative",
     "Ember",
     "Ascendant",
-    "Phoenix Prime"
 ]
+
+# Manual-only prestige role (bot never adds/removes it)
+MANUAL_PRIME_ROLE = "Phoenix Prime"
+
+# Rank thresholds tuned to your current distribution:
+# - Initiate: < 3 XP (3 messages to escape Initiate)
+# - Operative: 3–24 XP
+# - Ember: 25–79 XP
+# - Ascendant: 80+ XP (puts your current top ~5 into Ascendant)
+INITIATE_EXIT_XP = 3
+EMBER_XP = 25
+ASCENDANT_XP = 80
 
 # =========================
 # DISCORD SETUP
@@ -48,20 +59,16 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =========================
 DB_PATH = "xp.db"
 
-
 def now() -> int:
     return int(time.time())
 
-
 def minute_bucket(ts: int) -> int:
     return ts // 60
-
 
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_db():
     with db() as conn:
@@ -79,7 +86,6 @@ def init_db():
         """)
         conn.commit()
 
-
 def get_user(conn, guild_id: int, user_id: int):
     row = conn.execute(
         "SELECT * FROM users WHERE guild_id=? AND user_id=?",
@@ -94,30 +100,56 @@ def get_user(conn, guild_id: int, user_id: int):
         return get_user(conn, guild_id, user_id)
     return row
 
-
 def clamp_xp(xp: int) -> int:
-    return max(0, min(MAX_XP, xp))
-
+    return max(0, min(MAX_XP, int(xp)))
 
 def rank_from_xp(xp: int) -> str:
-    # Initiate should be basically “joined but didn’t engage”.
-    # You wanted 3 qualifying messages → 3 XP (since CHAT_XP_PER_TICK = 1)
-    if xp < 3:
-        return ROLE_NAMES[0]
-    if xp < MAX_XP * 0.4:
-        return ROLE_NAMES[1]
-    if xp < MAX_XP * 0.65:
-        return ROLE_NAMES[2]
-    if xp < MAX_XP * 0.9:
-        return ROLE_NAMES[3]
-    return ROLE_NAMES[4]
+    # Bot-managed only
+    if xp < INITIATE_EXIT_XP:
+        return ROLE_NAMES[0]  # Initiate
+    if xp < EMBER_XP:
+        return ROLE_NAMES[1]  # Operative
+    if xp < ASCENDANT_XP:
+        return ROLE_NAMES[2]  # Ember
+    return ROLE_NAMES[3]      # Ascendant
 
+def try_award_xp(conn, guild_id: int, user_id: int, amount: int) -> int:
+    user = get_user(conn, guild_id, user_id)
+    ts = now()
+    bucket = minute_bucket(ts)
+
+    earned = user["earned_this_minute"]
+    if bucket != user["last_minute"]:
+        earned = 0
+
+    remaining = PER_MINUTE_XP_CAP - earned
+    award = max(0, min(amount, remaining))
+
+    new_xp = clamp_xp(user["xp"] + award)
+
+    conn.execute("""
+        UPDATE users
+        SET xp=?, last_active=?, chat_cooldown=?,
+            last_minute=?, earned_this_minute=?
+        WHERE guild_id=? AND user_id=?
+    """, (
+        new_xp,
+        ts if award > 0 else user["last_active"],
+        user["chat_cooldown"],
+        bucket,
+        earned + award,
+        guild_id,
+        user_id
+    ))
+    conn.commit()
+
+    return award
 
 def try_award_xp_at(conn, guild_id: int, user_id: int, amount: int, ts: int) -> int:
     """
-    Award XP using a provided timestamp.
-    Enforces per-minute cap via last_minute/earned_this_minute.
-    Does NOT set chat_cooldown here; caller controls cooldown behavior.
+    Same logic as try_award_xp, but uses a provided timestamp (ts)
+    so audit/backfill respects historical per-minute cap.
+    (Cooldown is enforced outside this function.)
     """
     user = get_user(conn, guild_id, user_id)
     bucket = minute_bucket(ts)
@@ -133,7 +165,8 @@ def try_award_xp_at(conn, guild_id: int, user_id: int, amount: int, ts: int) -> 
 
     conn.execute("""
         UPDATE users
-        SET xp=?, last_active=?, last_minute=?, earned_this_minute=?
+        SET xp=?, last_active=?,
+            last_minute=?, earned_this_minute=?
         WHERE guild_id=? AND user_id=?
     """, (
         new_xp,
@@ -144,15 +177,14 @@ def try_award_xp_at(conn, guild_id: int, user_id: int, amount: int, ts: int) -> 
         user_id
     ))
     conn.commit()
+
     return award
 
-
-def try_award_xp(conn, guild_id: int, user_id: int, amount: int) -> int:
-    """Live award using current time."""
-    return try_award_xp_at(conn, guild_id, user_id, amount, now())
-
-
 async def sync_role(member: discord.Member, xp: int):
+    """
+    Keeps bot-managed roles aligned with XP.
+    Does NOT touch Phoenix Prime (manual prestige role).
+    """
     target = rank_from_xp(xp)
     roles = {r.name: r for r in member.guild.roles}
 
@@ -160,6 +192,8 @@ async def sync_role(member: discord.Member, xp: int):
         return
 
     to_add = roles[target]
+
+    # remove only bot-managed ranks (ROLE_NAMES), never Prime
     to_remove = [
         roles[name] for name in ROLE_NAMES
         if name in roles and roles[name] in member.roles and name != target
@@ -167,13 +201,17 @@ async def sync_role(member: discord.Member, xp: int):
 
     try:
         if to_remove:
-            await member.remove_roles(*to_remove)
+            await member.remove_roles(*to_remove, reason="XP rank sync")
         if to_add not in member.roles:
-            await member.add_roles(to_add)
-    except Exception:
-        # ignore permission/role hierarchy issues quietly
+            await member.add_roles(to_add, reason="XP rank sync")
+    except:
         pass
 
+def display_rank(member: discord.Member, xp: int) -> str:
+    # If they have manual Prime, show that in outputs, but bot still only manages Ascendant and below.
+    if any(r.name == MANUAL_PRIME_ROLE for r in member.roles):
+        return MANUAL_PRIME_ROLE
+    return rank_from_xp(xp)
 
 # =========================
 # EVENTS
@@ -185,7 +223,6 @@ async def on_ready():
     vc_tick.start()
     decay_loop.start()
     print(f"Logged in as {bot.user}")
-
 
 @bot.event
 async def on_message(msg: discord.Message):
@@ -204,8 +241,6 @@ async def on_message(msg: discord.Message):
             return
 
         awarded = try_award_xp(conn, msg.guild.id, msg.author.id, CHAT_XP_PER_TICK)
-
-        # set cooldown (live)
         conn.execute(
             "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
             (now() + CHAT_COOLDOWN_SECONDS, msg.guild.id, msg.author.id)
@@ -213,12 +248,10 @@ async def on_message(msg: discord.Message):
         conn.commit()
 
         if awarded:
-            xp = get_user(conn, msg.guild.id, msg.author.id)["xp"]
-            await sync_role(msg.author, xp)
-
+            await sync_role(msg.author, get_user(conn, msg.guild.id, msg.author.id)["xp"])
 
 # =========================
-# VOICE XP (LIVE ONLY)
+# VOICE XP
 # =========================
 @tasks.loop(seconds=60)
 async def vc_tick():
@@ -235,9 +268,7 @@ async def vc_tick():
                 with db() as conn:
                     awarded = try_award_xp(conn, guild.id, m.id, VC_XP_PER_MIN)
                     if awarded:
-                        xp = get_user(conn, guild.id, m.id)["xp"]
-                        await sync_role(m, xp)
-
+                        await sync_role(m, get_user(conn, guild.id, m.id)["xp"])
 
 # =========================
 # DECAY
@@ -266,7 +297,6 @@ async def decay_loop():
                 if member:
                     await sync_role(member, new_xp)
 
-
 # =========================
 # SLASH COMMANDS
 # =========================
@@ -278,11 +308,11 @@ async def balance(interaction: discord.Interaction):
     with db() as conn:
         user = get_user(conn, interaction.guild.id, interaction.user.id)
 
+    rank = display_rank(interaction.user, user["xp"])
     await interaction.response.send_message(
-        f"XP: **{user['xp']} / {MAX_XP}**\nRank: **{rank_from_xp(user['xp'])}**",
+        f"XP: **{user['xp']} / {MAX_XP}**\nRank: **{rank}**",
         ephemeral=True
     )
-
 
 @bot.tree.command(name="leaderboard")
 async def leaderboard(interaction: discord.Interaction):
@@ -292,16 +322,16 @@ async def leaderboard(interaction: discord.Interaction):
     guild = interaction.guild
     await interaction.response.defer(ephemeral=True)
 
-    # Fetch ALL members (don’t rely on cache)
-    members = {}
+    # Build a complete member map (not cache-dependent)
+    members: dict[int, discord.Member] = {}
     async for m in guild.fetch_members(limit=None):
-        if not m.bot:
-            members[m.id] = m
+        members[m.id] = m
 
-    # Ensure EVERY member has a DB row
+    # Ensure EVERY non-bot member has a DB row (so nobody is missing)
     with db() as conn:
-        for uid in members.keys():
-            get_user(conn, guild.id, uid)
+        for uid, m in members.items():
+            if not m.bot:
+                get_user(conn, guild.id, uid)
 
         rows = conn.execute(
             "SELECT user_id, xp FROM users WHERE guild_id=? ORDER BY xp DESC, user_id ASC",
@@ -309,13 +339,17 @@ async def leaderboard(interaction: discord.Interaction):
         ).fetchall()
 
     lines = []
-    for i, r in enumerate(rows, start=1):
+    place = 0
+    for r in rows:
         uid = r["user_id"]
         xp = r["xp"]
         m = members.get(uid)
-        name = m.display_name if m else f"User {uid}"
-        rank = rank_from_xp(xp)
-        lines.append(f"{i:>4}. {name} — {xp} XP — {rank}")
+        if not m or m.bot:
+            continue
+
+        place += 1
+        rank = display_rank(m, xp)
+        lines.append(f"{place:>4}. {m.display_name} — {xp} XP — {rank}")
 
     content = "\n".join(lines) if lines else "No users yet."
     file = discord.File(fp=io.BytesIO(content.encode("utf-8")), filename="leaderboard.txt")
@@ -325,7 +359,6 @@ async def leaderboard(interaction: discord.Interaction):
         file=file,
         ephemeral=True
     )
-
 
 @bot.tree.command(name="audit")
 @app_commands.describe(days="How many days back to scan (default 30)")
@@ -341,23 +374,6 @@ async def audit(interaction: discord.Interaction, days: int = 30):
 
     await interaction.response.defer(ephemeral=True)
 
-    # ---------- Fetch ALL members (not cache-dependent) ----------
-    members = {}
-    async for m in guild.fetch_members(limit=None):
-        if not m.bot:
-            members[m.id] = m
-
-    # Ensure EVERY member has a DB row (so nobody is missing)
-    with db() as conn:
-        for uid in members.keys():
-            get_user(conn, guild.id, uid)
-
-    scanned = 0
-    skipped_histories = 0
-
-    # user_id -> list[int timestamps]
-    user_msg_times: dict[int, list[int]] = {}
-
     def can_read_history(ch: discord.abc.GuildChannel) -> bool:
         me = guild.me
         if not me:
@@ -365,8 +381,23 @@ async def audit(interaction: discord.Interaction, days: int = 30):
         perms = ch.permissions_for(me)
         return bool(perms.view_channel and perms.read_message_history)
 
-    async def collect_history(messageable):
-        nonlocal scanned, skipped_histories
+    scanned = 0
+    awarded_total = 0
+    skipped_histories = 0
+    per_user: dict[int, int] = {}
+
+    # Ensure EVERY non-bot member exists in DB
+    members: dict[int, discord.Member] = {}
+    async for m in guild.fetch_members(limit=None):
+        if not m.bot:
+            members[m.id] = m
+
+    with db() as conn:
+        for uid in members.keys():
+            get_user(conn, guild.id, uid)
+
+    async def scan_history(messageable):
+        nonlocal scanned, awarded_total, skipped_histories
 
         if not can_read_history(messageable):
             skipped_histories += 1
@@ -383,141 +414,78 @@ async def audit(interaction: discord.Interaction, days: int = 30):
                 if len(content) < MIN_MESSAGE_CHARS:
                     continue
 
-                uid = msg.author.id
-                if uid not in members:  # user left / not in guild anymore
-                    continue
-
                 ts = int(msg.created_at.timestamp())
-                user_msg_times.setdefault(uid, []).append(ts)
+
+                with db() as conn:
+                    user = get_user(conn, guild.id, msg.author.id)
+
+                    # Historical cooldown check
+                    if ts < user["chat_cooldown"]:
+                        continue
+
+                    awarded = try_award_xp_at(conn, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
+
+                    # Set cooldown relative to historical msg time
+                    conn.execute(
+                        "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                        (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id)
+                    )
+                    conn.commit()
+
+                if awarded:
+                    awarded_total += awarded
+                    per_user[msg.author.id] = per_user.get(msg.author.id, 0) + awarded
 
         except Exception:
             skipped_histories += 1
 
-    async def collect_threads_for_channel(ch: discord.TextChannel):
+    async def scan_threads_for_channel(ch: discord.TextChannel):
         # active threads
-        try:
-            for th in ch.threads:
-                await collect_history(th)
-        except Exception:
-            pass
+        for th in getattr(ch, "threads", []):
+            await scan_history(th)
 
-        # archived public
+        # archived public threads
         try:
             async for th in ch.archived_threads(limit=None, private=False):
-                await collect_history(th)
+                await scan_history(th)
         except Exception:
             pass
 
-        # archived private
+        # archived private threads (requires perms)
         try:
             async for th in ch.archived_threads(limit=None, private=True):
-                await collect_history(th)
+                await scan_history(th)
         except Exception:
             pass
 
-    async def collect_forum_channel(forum: discord.ForumChannel):
-        # active threads
+    async def scan_forum_channel(forum: discord.ForumChannel):
         try:
             for th in forum.threads:
-                await collect_history(th)
+                await scan_history(th)
         except Exception:
             pass
 
-        # archived public
         try:
             async for th in forum.archived_threads(limit=None, private=False):
-                await collect_history(th)
+                await scan_history(th)
         except Exception:
             pass
 
-        # archived private
         try:
             async for th in forum.archived_threads(limit=None, private=True):
-                await collect_history(th)
+                await scan_history(th)
         except Exception:
             pass
 
-    # ---------- Collect messages (order doesn't matter anymore) ----------
+    # Scan all channels
     for ch in guild.channels:
         if isinstance(ch, discord.TextChannel):
-            await collect_history(ch)
-            await collect_threads_for_channel(ch)
+            await scan_history(ch)
+            await scan_threads_for_channel(ch)
         elif isinstance(ch, discord.ForumChannel):
-            await collect_forum_channel(ch)
+            await scan_forum_channel(ch)
 
-    # ---------- Simulate awards per user (sorted by time) ----------
-    def simulate_awards(times: list[int]) -> tuple[int, int]:
-        """
-        Returns (xp_awarded, last_active_ts)
-        Applies:
-          - CHAT_COOLDOWN_SECONDS
-          - PER_MINUTE_XP_CAP
-        """
-        if not times:
-            return 0, 0
-
-        times.sort()
-        xp = 0
-        last_active = 0
-
-        last_award_ts = -10**18  # very old
-        current_minute = None
-        earned_this_minute = 0
-
-        for ts in times:
-            last_active = ts
-
-            # cooldown
-            if ts < last_award_ts + CHAT_COOLDOWN_SECONDS:
-                continue
-
-            bucket = minute_bucket(ts)
-            if bucket != current_minute:
-                current_minute = bucket
-                earned_this_minute = 0
-
-            if earned_this_minute >= PER_MINUTE_XP_CAP:
-                continue
-
-            # award
-            xp += CHAT_XP_PER_TICK
-            earned_this_minute += CHAT_XP_PER_TICK
-            last_award_ts = ts
-
-        return xp, last_active
-
-    # ---------- Apply to DB + roles ----------
-    awarded_total = 0
-    users_with_gains = 0
-
-    # We'll also make a top-gains list
-    gains = []
-
-    with db() as conn:
-        for uid, member in members.items():
-            times = user_msg_times.get(uid, [])
-            gained, last_active_ts = simulate_awards(times)
-
-            if gained > 0:
-                users_with_gains += 1
-                gains.append((uid, gained))
-
-            # Update XP (additive) and last_active (max)
-            row = get_user(conn, guild.id, uid)
-            new_xp = clamp_xp(row["xp"] + gained)
-
-            new_last_active = row["last_active"]
-            if last_active_ts and last_active_ts > new_last_active:
-                new_last_active = last_active_ts
-
-            conn.execute(
-                "UPDATE users SET xp=?, last_active=? WHERE guild_id=? AND user_id=?",
-                (new_xp, new_last_active, guild.id, uid)
-            )
-
-        conn.commit()
-
-    # Role sync everyone
+    # Sync roles for EVERY member (Prime unaffected)
     updated = 0
     for uid, member in members.items():
         with db() as conn:
@@ -525,9 +493,8 @@ async def audit(interaction: discord.Interaction, days: int = 30):
         await sync_role(member, xp)
         updated += 1
 
-    awarded_total = sum(g for _, g in gains)
-
-    top = sorted(gains, key=lambda x: x[1], reverse=True)[:10]
+    # Top gains
+    top = sorted(per_user.items(), key=lambda x: x[1], reverse=True)[:10]
     top_lines = []
     for i, (uid, gained) in enumerate(top, start=1):
         m = members.get(uid)
@@ -539,8 +506,7 @@ async def audit(interaction: discord.Interaction, days: int = 30):
         f"Audit window: last {days} day(s)",
         f"Cutoff (UTC): {cutoff_dt.isoformat()}",
         f"Scanned messages: {scanned}",
-        f"Users with qualifying messages: {len(user_msg_times)}",
-        f"Users with gains: {users_with_gains}",
+        f"Users with gains: {len(per_user)}",
         f"Users role-synced: {updated}",
         f"Total XP awarded: {awarded_total}",
         f"Histories skipped (perms/errors): {skipped_histories}",
@@ -562,18 +528,11 @@ async def audit(interaction: discord.Interaction, days: int = 30):
         ephemeral=True
     )
 
-
-
 # =========================
 # RUN
 # =========================
 token = os.getenv("DISCORD_TOKEN")
 print("DISCORD_TOKEN present?", bool(token), "len=", len(token) if token else 0)
-if not token:
-    raise RuntimeError("DISCORD_TOKEN missing in Railway environment")
-
-bot.run(token)
-
 if not token:
     raise RuntimeError("DISCORD_TOKEN missing in Railway environment")
 bot.run(token)
