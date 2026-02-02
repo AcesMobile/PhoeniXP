@@ -223,7 +223,7 @@ async def silent_startup_audit():
                 if not perms.view_channel or not perms.read_message_history:
                     continue
                 try:
-                    async for msg in ch.history(after=cutoff, oldest_first=True):
+                 async for msg in ch.history(after=cutoff, oldest_first=True, limit=None):
                         if msg.author.bot:
                             continue
                         if len((msg.content or "").strip()) < MIN_MESSAGE_CHARS:
