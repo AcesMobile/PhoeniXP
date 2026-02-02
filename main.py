@@ -14,9 +14,8 @@ MIN_MESSAGE_CHARS = 4
 CHAT_COOLDOWN_SECONDS = 60
 CHAT_XP_PER_TICK = 1
 
-VC_XP_PER_5MIN = 1
-VC_CHECK_SECONDS = 60
-VC_MINUTES_PER_XP = 5
+VC_CHECK_SECONDS = 60          # how often we tick VC
+VC_MINUTES_PER_XP = 5          # 1 XP per 5 minutes
 
 PER_MINUTE_XP_CAP = 2
 
@@ -38,7 +37,6 @@ ROLE_NAMES = [ROLE_INITIATE, ROLE_OPERATIVE, ROLE_EMBER, ROLE_ASCENDANT]
 MANUAL_PRIME_ROLE = "Phoenix Prime"
 
 DB_PATH = "xp.db"
-
 ROLE_SYNC_DEBOUNCE_SECONDS = 20
 
 STARTUP_AUDIT_DAYS = 365
@@ -55,10 +53,11 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # -------------------------
-# DB
+# DB HELPERS
 # -------------------------
 def now(): return int(time.time())
 def minute_bucket(ts): return ts // 60
+def clamp_xp(x): return max(0, min(MAX_XP, int(x)))
 
 def db():
     c = sqlite3.connect(DB_PATH)
@@ -90,90 +89,52 @@ def init_db():
 
 def get_user(c, gid, uid):
     r = c.execute("SELECT * FROM users WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
-    if not r:
-        c.execute("INSERT INTO users (guild_id, user_id) VALUES (?,?)", (gid, uid))
-        c.commit()
-        return get_user(c, gid, uid)
-    return r
+    if r: return r
+    c.execute("INSERT INTO users (guild_id, user_id) VALUES (?,?)", (gid, uid))
+    c.commit()
+    return c.execute("SELECT * FROM users WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
 
-def clamp_xp(x): return max(0, min(MAX_XP, int(x)))
+def meta_get(c, key, default=None):
+    r = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else default
+
+def meta_set(c, key, value):
+    c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
 
 def has_prime(m): return any(r.name == MANUAL_PRIME_ROLE for r in m.roles)
+def is_admin(i): return isinstance(i.user, discord.Member) and has_prime(i.user)
 
-def is_admin(i):
-    return isinstance(i.user, discord.Member) and has_prime(i.user)
+async def fetch_members(guild):
+    out = {}
+    async for m in guild.fetch_members(limit=None):
+        if not m.bot:
+            out[m.id] = m
+    return out
 
 # -------------------------
-# XP CORE
+# XP
 # -------------------------
 def award_xp(c, gid, uid, amount, ts):
     u = get_user(c, gid, uid)
-
     bucket = minute_bucket(ts)
-    earned = u["earned_this_minute"]
 
+    earned = u["earned_this_minute"]
     if bucket != u["last_minute"]:
         earned = 0
 
-    remaining = PER_MINUTE_XP_CAP - earned
-    award = max(0, min(amount, remaining))
-    if award == 0:
+    award = max(0, min(amount, PER_MINUTE_XP_CAP - earned))
+    if not award:
         return 0
-
-    new_xp = clamp_xp(u["xp"] + award)
 
     c.execute("""
         UPDATE users
         SET xp=?, last_active=?, last_minute=?, earned_this_minute=?
         WHERE guild_id=? AND user_id=?
-    """, (new_xp, ts, bucket, earned + award, gid, uid))
-
+    """, (clamp_xp(u["xp"] + award), ts, bucket, earned + award, gid, uid))
     return award
 
 # -------------------------
-# VC XP (1 XP per 5 minutes)
-# -------------------------
-@tasks.loop(seconds=VC_CHECK_SECONDS)
-async def vc_xp_loop():
-    ts = now()
-
-    for guild in bot.guilds:
-        any_gain = False
-
-        for vc in guild.voice_channels:
-            humans = [m for m in vc.members if not m.bot]
-
-            if len(humans) < 2:
-                continue
-
-            for m in humans:
-                if m.voice and (m.voice.deaf or m.voice.self_deaf):
-                    continue
-
-                with db() as c:
-                    u = get_user(c, guild.id, m.id)
-
-                    minutes = u["vc_minutes"] + 1
-                    award = 0
-
-                    if minutes >= VC_MINUTES_PER_XP:
-                        award = award_xp(c, guild.id, m.id, VC_XP_PER_5MIN, ts)
-                        minutes = 0
-
-                    c.execute("""
-                        UPDATE users SET vc_minutes=? WHERE guild_id=? AND user_id=?
-                    """, (minutes, guild.id, m.id))
-
-                    c.commit()
-
-                    if award:
-                        any_gain = True
-
-        if any_gain:
-            await request_role_sync(guild)
-
-# -------------------------
-# RANKING
+# RANKING (TOP-X)
 # -------------------------
 def compute_rank_map(gid, member_ids):
     with db() as c:
@@ -185,8 +146,8 @@ def compute_rank_map(gid, member_ids):
     eligible = [(uid, xp.get(uid, 0)) for uid in member_ids if xp.get(uid, 0) >= INITIATE_EXIT_XP]
     eligible.sort(key=lambda x: (-x[1], x[0]))
 
-    topA = set(uid for uid, _ in eligible[:TOP_ASCENDANT])
-    nextE = set(uid for uid, _ in eligible[TOP_ASCENDANT:TOP_ASCENDANT + NEXT_EMBER])
+    topA = {uid for uid, _ in eligible[:TOP_ASCENDANT]}
+    nextE = {uid for uid, _ in eligible[TOP_ASCENDANT:TOP_ASCENDANT + NEXT_EMBER]}
 
     out = {}
     for uid in member_ids:
@@ -220,16 +181,12 @@ async def sync_all_roles(guild):
     roles = {r.name: r for r in guild.roles}
     managed = [roles[n] for n in ROLE_NAMES if n in roles]
 
-    members = {}
-    async for m in guild.fetch_members(limit=None):
-        if not m.bot:
-            members[m.id] = m
-
+    members = await fetch_members(guild)
     rank_map = compute_rank_map(guild.id, list(members.keys()))
 
     ok = failed = 0
     for uid, m in members.items():
-        target = roles.get(rank_map.get(uid))
+        target = roles.get(rank_map.get(uid, ROLE_INITIATE))
         if not target:
             failed += 1
             continue
@@ -245,27 +202,26 @@ async def sync_all_roles(guild):
     return ok, failed
 
 # -------------------------
-# STARTUP AUDIT
+# STARTUP AUDIT (SLOW)
 # -------------------------
 async def silent_startup_audit():
     for guild in bot.guilds:
         key = f"startup_audit_done:{guild.id}"
 
         with db() as c:
-            done = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-            if done and done["value"] == "1":
+            if meta_get(c, key) == "1":
                 continue
-            c.execute("INSERT OR REPLACE INTO meta VALUES (?, '1')", (key,))
+            meta_set(c, key, "1")
             c.commit()
 
         cutoff = datetime.utcnow() - timedelta(days=STARTUP_AUDIT_DAYS)
+        scanned = 0
 
         with db() as c:
             for ch in guild.text_channels:
                 perms = ch.permissions_for(guild.me)
                 if not perms.view_channel or not perms.read_message_history:
                     continue
-
                 try:
                     async for msg in ch.history(after=cutoff, oldest_first=True):
                         if msg.author.bot:
@@ -275,11 +231,15 @@ async def silent_startup_audit():
 
                         ts = int(msg.created_at.timestamp())
                         u = get_user(c, guild.id, msg.author.id)
-
                         if ts < u["chat_cooldown"]:
                             continue
 
                         award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
+                        scanned += 1
+
+                        if scanned % AUDIT_SLEEP_EVERY_MSGS == 0:
+                            c.commit()
+                            await asyncio.sleep(AUDIT_SLEEP_SECONDS)
 
                 except:
                     pass
@@ -306,27 +266,57 @@ async def on_message(msg):
         return
     await bot.process_commands(msg)
 
-    content = (msg.content or "").strip()
-    if len(content) < MIN_MESSAGE_CHARS:
+    if len((msg.content or "").strip()) < MIN_MESSAGE_CHARS:
         return
 
     ts = now()
-
     with db() as c:
         u = get_user(c, msg.guild.id, msg.author.id)
         if ts < u["chat_cooldown"]:
             return
 
         gained = award_xp(c, msg.guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
-
-        c.execute("""
-        UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?
-        """, (ts + CHAT_COOLDOWN_SECONDS, msg.guild.id, msg.author.id))
-
+        c.execute("UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                  (ts + CHAT_COOLDOWN_SECONDS, msg.guild.id, msg.author.id))
         c.commit()
 
     if gained:
         await request_role_sync(msg.guild)
+
+# -------------------------
+# VC XP (1 XP per 5 minutes)
+# -------------------------
+@tasks.loop(seconds=VC_CHECK_SECONDS)
+async def vc_xp_loop():
+    ts = now()
+    for guild in bot.guilds:
+        any_gain = False
+
+        for vc in guild.voice_channels:
+            humans = [m for m in vc.members if not m.bot]
+            if len(humans) < 2:
+                continue
+
+            with db() as c:
+                for m in humans:
+                    if m.voice and (m.voice.deaf or m.voice.self_deaf):
+                        continue
+
+                    u = get_user(c, guild.id, m.id)
+                    minutes = u["vc_minutes"] + 1
+
+                    if minutes >= VC_MINUTES_PER_XP:
+                        if award_xp(c, guild.id, m.id, 1, ts):
+                            any_gain = True
+                        minutes = 0
+
+                    c.execute("UPDATE users SET vc_minutes=? WHERE guild_id=? AND user_id=?",
+                              (minutes, guild.id, m.id))
+
+                c.commit()
+
+        if any_gain:
+            await request_role_sync(guild)
 
 # -------------------------
 # DECAY
@@ -337,11 +327,9 @@ async def decay_loop():
 
     for guild in bot.guilds:
         changed = False
-
         with db() as c:
-            rows = c.execute("""
-            SELECT user_id, xp, last_active FROM users WHERE guild_id=?
-            """, (guild.id,)).fetchall()
+            rows = c.execute("SELECT user_id, xp, last_active FROM users WHERE guild_id=?",
+                             (guild.id,)).fetchall()
 
             for r in rows:
                 xp = r["xp"]
@@ -350,14 +338,12 @@ async def decay_loop():
 
                 loss = max(int(xp * DECAY_PERCENT_PER_DAY), DECAY_MIN_XP_PER_DAY)
                 new_xp = clamp_xp(xp - loss)
-
                 if xp >= DECAY_FLOOR_XP:
                     new_xp = max(DECAY_FLOOR_XP, new_xp)
 
                 if new_xp != xp:
-                    c.execute("""
-                    UPDATE users SET xp=? WHERE guild_id=? AND user_id=?
-                    """, (new_xp, guild.id, r["user_id"]))
+                    c.execute("UPDATE users SET xp=? WHERE guild_id=? AND user_id=?",
+                              (new_xp, guild.id, r["user_id"]))
                     changed = True
 
             c.commit()
@@ -370,101 +356,81 @@ async def decay_loop():
 # -------------------------
 @bot.tree.command(name="standing")
 async def standing(interaction: discord.Interaction):
-
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
 
     guild = interaction.guild
-    member = interaction.user
+    me = interaction.user
 
     await interaction.response.defer(ephemeral=True)
 
-    members = {}
-    async for m in guild.fetch_members(limit=None):
-        if not m.bot:
-            members[m.id] = m
+    members = await fetch_members(guild)
+    ids = list(members.keys())
 
     with db() as c:
-        for uid in members:
+        for uid in ids:
             get_user(c, guild.id, uid)
-
         rows = c.execute("""
-        SELECT user_id, xp FROM users
-        WHERE guild_id=?
-        ORDER BY xp DESC, user_id ASC
+            SELECT user_id, xp FROM users
+            WHERE guild_id=?
+            ORDER BY xp DESC, user_id ASC
         """, (guild.id,)).fetchall()
 
-    rank_map = compute_rank_map(guild.id, list(members.keys()))
+    rank_map = compute_rank_map(guild.id, ids)
 
-    place = total = xp = 0
-
+    place = total = myxp = 0
     for r in rows:
         uid = r["user_id"]
         if uid not in members:
             continue
         total += 1
-        if uid == member.id:
+        if uid == me.id:
             place = total
-            xp = r["xp"]
+            myxp = r["xp"]
 
     await interaction.followup.send(
         f"📊 Standing\n"
         f"Place: #{place}/{total}\n"
-        f"XP: {xp}/{MAX_XP}\n"
-        f"Tier: {display_rank(member, rank_map.get(member.id, ROLE_INITIATE))}",
+        f"XP: {myxp}/{MAX_XP}\n"
+        f"Tier: {display_rank(me, rank_map.get(me.id, ROLE_INITIATE))}",
         ephemeral=True
     )
 
 @bot.tree.command(name="leaderboard")
 @app_commands.describe(announce="Post publicly")
 async def leaderboard(interaction: discord.Interaction, announce: bool = False):
-
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
 
     guild = interaction.guild
     await interaction.response.defer(ephemeral=not announce)
 
-    members = {}
-    async for m in guild.fetch_members(limit=None):
-        if not m.bot:
-            members[m.id] = m
+    members = await fetch_members(guild)
+    ids = list(members.keys())
 
     with db() as c:
-        for uid in members:
+        for uid in ids:
             get_user(c, guild.id, uid)
-
         rows = c.execute("""
-        SELECT user_id, xp FROM users
-        WHERE guild_id=?
-        ORDER BY xp DESC, user_id ASC
+            SELECT user_id, xp FROM users
+            WHERE guild_id=?
+            ORDER BY xp DESC, user_id ASC
         """, (guild.id,)).fetchall()
 
-    rank_map = compute_rank_map(guild.id, list(members.keys()))
+    rank_map = compute_rank_map(guild.id, ids)
 
-    lines = []
-    place = 0
-
+    lines, place = [], 0
     for r in rows:
         uid = r["user_id"]
         if uid not in members:
             continue
-
         place += 1
         m = members[uid]
         xp = r["xp"]
-
-        lines.append(
-            f"{place:>4}. {m.display_name} — {xp} XP — "
-            f"{display_rank(m, rank_map.get(uid, ROLE_INITIATE))}"
-        )
+        lines.append(f"{place:>4}. {m.display_name} — {xp} XP — {display_rank(m, rank_map.get(uid, ROLE_INITIATE))}")
 
     preview = "\n".join(lines[:30]) if lines else "No users."
-
-    file = discord.File(
-        fp=io.BytesIO("\n".join(lines).encode()),
-        filename="leaderboard.txt"
-    )
+    file = discord.File(fp=io.BytesIO("\n".join(lines).encode()), filename="leaderboard.txt")
 
     await interaction.followup.send("✅ Leaderboard\n" + preview, ephemeral=not announce)
     await interaction.followup.send(file=file, ephemeral=not announce)
@@ -472,10 +438,8 @@ async def leaderboard(interaction: discord.Interaction, announce: bool = False):
 @bot.tree.command(name="audit")
 @app_commands.describe(days="Days back", announce="Post publicly")
 async def audit(interaction: discord.Interaction, days: int = 30, announce: bool = False):
-
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
-
     if not is_admin(interaction):
         return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
 
@@ -485,85 +449,71 @@ async def audit(interaction: discord.Interaction, days: int = 30, announce: bool
     await interaction.response.defer(ephemeral=not announce)
 
     scanned = awarded = skipped = 0
+    throttle = 0
 
-    for ch in guild.text_channels:
-        perms = ch.permissions_for(guild.me)
-        if not perms.view_channel or not perms.read_message_history:
-            skipped += 1
-            continue
+    with db() as c:
+        for ch in guild.text_channels:
+            perms = ch.permissions_for(guild.me)
+            if not perms.view_channel or not perms.read_message_history:
+                skipped += 1
+                continue
 
-        try:
-            async for msg in ch.history(after=cutoff, oldest_first=True):
-                scanned += 1
+            try:
+                async for msg in ch.history(after=cutoff, oldest_first=True):
+                    scanned += 1
+                    if msg.author.bot:
+                        continue
+                    if len((msg.content or "").strip()) < MIN_MESSAGE_CHARS:
+                        continue
 
-                if msg.author.bot:
-                    continue
+                    awarded += award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK,
+                                       ts=int(msg.created_at.timestamp()))
+                    throttle += 1
+                    if throttle % AUDIT_SLEEP_EVERY_MSGS == 0:
+                        c.commit()
+                        await asyncio.sleep(AUDIT_SLEEP_SECONDS)
 
-                if len((msg.content or "").strip()) < MIN_MESSAGE_CHARS:
-                    continue
+            except:
+                skipped += 1
 
-                with db() as c:
-                    awarded += award_xp(
-                        c,
-                        guild.id,
-                        msg.author.id,
-                        CHAT_XP_PER_TICK,
-                        ts=int(msg.created_at.timestamp())
-                    )
-                    c.commit()
-
-        except:
-            skipped += 1
+        c.commit()
 
     ok, failed = await sync_all_roles(guild)
 
-    text = (
-        f"Audit complete\n"
-        f"Days: {days}\n"
-        f"Scanned: {scanned}\n"
-        f"Awarded XP: {awarded}\n"
-        f"Role Sync: {ok}/{failed}\n"
-        f"Skipped Channels: {skipped}"
+    await interaction.followup.send(
+        f"Audit complete\nDays: {days}\nScanned: {scanned}\nAwarded XP: {awarded}\n"
+        f"Role Sync: {ok}/{failed}\nSkipped Channels: {skipped}",
+        ephemeral=not announce
     )
-
-    await interaction.followup.send(text, ephemeral=not announce)
 
 @bot.tree.command(name="resetranks")
 @app_commands.describe(member="Optional single member")
 async def resetranks(interaction: discord.Interaction, member: discord.Member | None = None):
-
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
-
     if not is_admin(interaction):
         return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
 
     guild = interaction.guild
     await interaction.response.defer(ephemeral=True)
 
-    members = {}
-    async for m in guild.fetch_members(limit=None):
-        if not m.bot:
-            members[m.id] = m
-
+    members = await fetch_members(guild)
     targets = [member.id] if member else list(members.keys())
 
     changed = 0
-
     with db() as c:
         for uid in targets:
             u = get_user(c, guild.id, uid)
-
             old = u["xp"]
             new = old if old < INITIATE_EXIT_XP else INITIATE_EXIT_XP
-
             if new != old:
                 changed += 1
 
             c.execute("""
-            UPDATE users SET xp=?, last_active=0,
-            chat_cooldown=0, last_minute=0, earned_this_minute=0
-            WHERE guild_id=? AND user_id=?
+                UPDATE users
+                SET xp=?, last_active=0, chat_cooldown=0,
+                    last_minute=0, earned_this_minute=0, vc_minutes=0
+                WHERE guild_id=? AND user_id=?
             """, (new, guild.id, uid))
 
         c.commit()
@@ -578,26 +528,22 @@ async def resetranks(interaction: discord.Interaction, member: discord.Member | 
 @bot.tree.command(name="setxp")
 @app_commands.describe(member="User", xp="New XP", announce="Public?")
 async def setxp(interaction: discord.Interaction, member: discord.Member, xp: int, announce: bool = False):
-
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
-
     if not is_admin(interaction):
         return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
 
     xp = clamp_xp(xp)
-
     await interaction.response.defer(ephemeral=not announce)
 
     with db() as c:
         get_user(c, interaction.guild.id, member.id)
-
         c.execute("""
-        UPDATE users SET xp=?, last_active=?, chat_cooldown=0,
-        last_minute=0, earned_this_minute=0
-        WHERE guild_id=? AND user_id=?
+            UPDATE users
+            SET xp=?, last_active=?, chat_cooldown=0,
+                last_minute=0, earned_this_minute=0, vc_minutes=0
+            WHERE guild_id=? AND user_id=?
         """, (xp, now(), interaction.guild.id, member.id))
-
         c.commit()
 
     ok, failed = await sync_all_roles(interaction.guild)
