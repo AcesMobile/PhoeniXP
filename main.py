@@ -527,6 +527,46 @@ async def resetranks(interaction: discord.Interaction, member: discord.Member | 
         f"Reset complete\nChanged XP: {changed}\nRole Sync: {ok}/{failed}",
         ephemeral=True
     )
+@bot.tree.command(name="setxp")
+@app_commands.describe(
+    member="User to set XP for",
+    xp="New XP value",
+    announce="Post publicly"
+)
+async def setxp(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    xp: int,
+    announce: bool = False
+):
+    if not interaction.guild:
+        return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+    if not is_admin(interaction):
+        return await interaction.response.send_message(
+            "Phoenix Prime only.",
+            ephemeral=True
+        )
+
+    xp = clamp_xp(xp)
+
+    await interaction.response.defer(ephemeral=not announce)
+
+    with db() as c:
+        get_user(c, interaction.guild.id, member.id)
+        c.execute(
+            "UPDATE users SET xp=?, last_active=?, chat_cooldown=0, last_minute=0, earned_this_minute=0 WHERE guild_id=? AND user_id=?",
+            (xp, now(), interaction.guild.id, member.id)
+        )
+        c.commit()
+
+    ok, failed = await sync_all_roles(interaction.guild)
+
+    await interaction.followup.send(
+        f"✅ Set XP for **{member.display_name}** → **{xp} XP**\n"
+        f"Role sync → {ok} ok / {failed} failed",
+        ephemeral=not announce
+    )
 
 # -------------------------
 # RUN
