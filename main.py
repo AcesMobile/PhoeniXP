@@ -93,8 +93,11 @@ def get_user(c, gid, uid):
 
 def clamp_xp(x): return max(0, min(MAX_XP, int(x)))
 
+# ⭐ PRIME = ADMIN
 def is_admin(i):
-    return bool(i.user and i.user.guild_permissions and i.user.guild_permissions.administrator)
+    if not isinstance(i.user, discord.Member):
+        return False
+    return any(r.name == MANUAL_PRIME_ROLE for r in i.user.roles)
 
 def has_prime(m):
     return any(r.name == MANUAL_PRIME_ROLE for r in m.roles)
@@ -126,7 +129,7 @@ def award_xp(c, gid, uid, amount, ts=None):
     return award
 
 # -------------------------
-# RANKING (TOP-X)
+# RANKING
 # -------------------------
 def compute_rank_map(gid, member_ids):
     with db() as c:
@@ -185,7 +188,7 @@ def display_rank(m, computed):
     return f"{MANUAL_PRIME_ROLE} + {computed}" if has_prime(m) else computed
 
 # -------------------------
-# SILENT STARTUP AUDIT
+# STARTUP AUDIT
 # -------------------------
 async def silent_startup_audit():
     with db() as c:
@@ -321,6 +324,56 @@ async def decay_loop():
 # -------------------------
 # COMMANDS
 # -------------------------
+
+# ⭐ STANDING (Always Private)
+@bot.tree.command(name="standing")
+async def standing(interaction: discord.Interaction):
+
+    if not interaction.guild:
+        return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+    guild = interaction.guild
+    member = interaction.user
+
+    await interaction.response.defer(ephemeral=True)
+
+    members = {}
+    async for m in guild.fetch_members(limit=None):
+        if not m.bot:
+            members[m.id] = m
+
+    with db() as c:
+        for uid in members.keys():
+            get_user(c, guild.id, uid)
+
+        rows = c.execute("""
+            SELECT user_id, xp FROM users
+            WHERE guild_id=?
+            ORDER BY xp DESC, user_id ASC
+        """, (guild.id,)).fetchall()
+
+    rank_map = compute_rank_map(guild.id, list(members.keys()))
+
+    place = total = xp = 0
+
+    for r in rows:
+        uid = r["user_id"]
+        if uid not in members:
+            continue
+        total += 1
+        if uid == member.id:
+            place = total
+            xp = r["xp"]
+
+    await interaction.followup.send(
+        f"📊 Standing\n"
+        f"Place: #{place} / {total}\n"
+        f"XP: {xp} / {MAX_XP}\n"
+        f"Tier: {display_rank(member, rank_map.get(member.id, ROLE_INITIATE))}",
+        ephemeral=True
+    )
+
+# ⭐ LEADERBOARD (Optional Public)
 @bot.tree.command(name="leaderboard")
 @app_commands.describe(announce="Post publicly")
 async def leaderboard(interaction: discord.Interaction, announce: bool = False):
@@ -362,31 +415,25 @@ async def leaderboard(interaction: discord.Interaction, announce: bool = False):
         )
 
     preview = "\n".join(lines[:30]) if lines else "No users."
-    if len(lines) > 30:
-        preview += f"\n… and {len(lines)-30} more (see file)"
 
     file = discord.File(
         fp=io.BytesIO("\n".join(lines).encode()),
         filename="leaderboard.txt"
     )
 
-    await interaction.followup.send(
-        "✅ Leaderboard\n" + preview,
-        ephemeral=not announce
-    )
-    await interaction.followup.send(
-        file=file,
-        ephemeral=not announce
-    )
+    await interaction.followup.send("✅ Leaderboard\n" + preview, ephemeral=not announce)
+    await interaction.followup.send(file=file, ephemeral=not announce)
 
+# ⭐ AUDIT (Prime Only)
 @bot.tree.command(name="audit")
 @app_commands.describe(days="Days back", announce="Post publicly")
 async def audit(interaction: discord.Interaction, days: int = 30, announce: bool = False):
 
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
+
     if not is_admin(interaction):
-        return await interaction.response.send_message("Admin only.", ephemeral=True)
+        return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
 
     guild = interaction.guild
     cutoff = datetime.utcnow() - timedelta(days=days)
@@ -429,8 +476,57 @@ async def audit(interaction: discord.Interaction, days: int = 30, announce: bool
         f"Skipped Channels: {skipped}"
     )
 
-    file = discord.File(fp=io.BytesIO(text.encode()), filename="audit_report.txt")
-    await interaction.followup.send(text, file=file, ephemeral=not announce)
+    await interaction.followup.send(text, ephemeral=not announce)
+
+# ⭐ RESET RANKS (Prime Only, Always Private)
+@bot.tree.command(name="resetranks")
+@app_commands.describe(member="Optional: reset one member only")
+async def resetranks(interaction: discord.Interaction, member: discord.Member | None = None):
+
+    if not interaction.guild:
+        return await interaction.response.send_message("Guild only.", ephemeral=True)
+
+    if not is_admin(interaction):
+        return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True)
+
+    members = {}
+    async for m in guild.fetch_members(limit=None):
+        if not m.bot:
+            members[m.id] = m
+
+    if member:
+        if member.bot:
+            return await interaction.followup.send("Can't reset bot.", ephemeral=True)
+        targets = [member.id]
+    else:
+        targets = list(members.keys())
+
+    changed = 0
+
+    with db() as c:
+        for uid in targets:
+            u = get_user(c, guild.id, uid)
+            old = u["xp"]
+            new = old if old < INITIATE_EXIT_XP else INITIATE_EXIT_XP
+            if new != old:
+                changed += 1
+            c.execute("""
+                UPDATE users
+                SET xp=?, last_active=0, chat_cooldown=0,
+                    last_minute=0, earned_this_minute=0
+                WHERE guild_id=? AND user_id=?
+            """, (new, guild.id, uid))
+        c.commit()
+
+    ok, failed = await sync_all_roles(guild)
+
+    await interaction.followup.send(
+        f"Reset complete\nChanged XP: {changed}\nRole Sync: {ok}/{failed}",
+        ephemeral=True
+    )
 
 # -------------------------
 # RUN
