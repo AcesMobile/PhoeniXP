@@ -14,10 +14,10 @@ MIN_MESSAGE_CHARS = 4
 CHAT_COOLDOWN_SECONDS = 60
 CHAT_XP_PER_TICK = 1
 
-VC_CHECK_SECONDS = 60          # how often we tick VC
-VC_MINUTES_PER_XP = 5          # 1 XP per 5 minutes
+VC_CHECK_SECONDS = 60           # tick VC every minute
+VC_MINUTES_PER_XP = 5           # 1 XP per 5 minutes in VC
 
-PER_MINUTE_XP_CAP = 2
+PER_MINUTE_XP_CAP = 2           # cap per minute bucket (chat + vc combined)
 
 DECAY_GRACE_HOURS = 72
 DECAY_PERCENT_PER_DAY = 0.01
@@ -34,7 +34,7 @@ ROLE_EMBER = "Ember"
 ROLE_ASCENDANT = "Ascendant"
 ROLE_NAMES = [ROLE_INITIATE, ROLE_OPERATIVE, ROLE_EMBER, ROLE_ASCENDANT]
 
-MANUAL_PRIME_ROLE = "Phoenix Prime"
+MANUAL_PRIME_ROLE = "Phoenix Prime"  # primes are “admins”
 
 DB_PATH = "xp.db"
 ROLE_SYNC_DEBOUNCE_SECONDS = 20
@@ -55,9 +55,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # -------------------------
 # DB HELPERS
 # -------------------------
-def now(): return int(time.time())
-def minute_bucket(ts): return ts // 60
-def clamp_xp(x): return max(0, min(MAX_XP, int(x)))
+def now() -> int: return int(time.time())
+def minute_bucket(ts: int) -> int: return ts // 60
+def clamp_xp(x: int) -> int: return max(0, min(MAX_XP, int(x)))
 
 def db():
     c = sqlite3.connect(DB_PATH)
@@ -87,42 +87,55 @@ def init_db():
         """)
         c.commit()
 
-def get_user(c, gid, uid):
+def get_user(c, gid: int, uid: int):
     r = c.execute("SELECT * FROM users WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
-    if r: return r
+    if r:
+        return r
     c.execute("INSERT INTO users (guild_id, user_id) VALUES (?,?)", (gid, uid))
     c.commit()
     return c.execute("SELECT * FROM users WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
 
-def meta_get(c, key, default=None):
+def meta_get(c, key: str, default=None):
     r = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return r["value"] if r else default
 
-def meta_set(c, key, value):
+def meta_set(c, key: str, value):
     c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
 
-def has_prime(m): return any(r.name == MANUAL_PRIME_ROLE for r in m.roles)
-def is_admin(i): return isinstance(i.user, discord.Member) and has_prime(i.user)
+def has_prime(m: discord.Member) -> bool:
+    return any(r.name == MANUAL_PRIME_ROLE for r in m.roles)
 
-async def fetch_members(guild):
+def is_admin(i: discord.Interaction) -> bool:
+    return isinstance(i.user, discord.Member) and has_prime(i.user)
+
+async def fetch_members(guild: discord.Guild) -> dict[int, discord.Member]:
     out = {}
     async for m in guild.fetch_members(limit=None):
         if not m.bot:
             out[m.id] = m
     return out
 
+def reset_audit_state(c, gid: int):
+    # wipe audit throttles so historical scan isn't blocked by old state
+    c.execute("""
+        UPDATE users
+        SET chat_cooldown=0, last_minute=0, earned_this_minute=0
+        WHERE guild_id=?
+    """, (gid,))
+
 # -------------------------
-# XP
+# XP CORE
 # -------------------------
-def award_xp(c, gid, uid, amount, ts):
+def award_xp(c, gid: int, uid: int, amount: int, ts: int) -> int:
+    """Awards XP with per-minute bucket cap. Caller commits."""
     u = get_user(c, gid, uid)
     bucket = minute_bucket(ts)
 
-    earned = u["earned_this_minute"]
-    if bucket != u["last_minute"]:
+    earned = int(u["earned_this_minute"])
+    if bucket != int(u["last_minute"]):
         earned = 0
 
-    award = max(0, min(amount, PER_MINUTE_XP_CAP - earned))
+    award = max(0, min(int(amount), PER_MINUTE_XP_CAP - earned))
     if not award:
         return 0
 
@@ -130,19 +143,19 @@ def award_xp(c, gid, uid, amount, ts):
         UPDATE users
         SET xp=?, last_active=?, last_minute=?, earned_this_minute=?
         WHERE guild_id=? AND user_id=?
-    """, (clamp_xp(u["xp"] + award), ts, bucket, earned + award, gid, uid))
+    """, (clamp_xp(int(u["xp"]) + award), ts, bucket, earned + award, gid, uid))
     return award
 
 # -------------------------
 # RANKING (TOP-X)
 # -------------------------
-def compute_rank_map(gid, member_ids):
+def compute_rank_map(gid: int, member_ids: list[int]) -> dict[int, str]:
     with db() as c:
         for uid in member_ids:
             get_user(c, gid, uid)
         rows = c.execute("SELECT user_id, xp FROM users WHERE guild_id=?", (gid,)).fetchall()
 
-    xp = {r["user_id"]: r["xp"] for r in rows}
+    xp = {int(r["user_id"]): int(r["xp"]) for r in rows}
     eligible = [(uid, xp.get(uid, 0)) for uid in member_ids if xp.get(uid, 0) >= INITIATE_EXIT_XP]
     eligible.sort(key=lambda x: (-x[1], x[0]))
 
@@ -152,57 +165,64 @@ def compute_rank_map(gid, member_ids):
     out = {}
     for uid in member_ids:
         x = xp.get(uid, 0)
-        if x < INITIATE_EXIT_XP: out[uid] = ROLE_INITIATE
-        elif uid in topA: out[uid] = ROLE_ASCENDANT
-        elif uid in nextE: out[uid] = ROLE_EMBER
-        else: out[uid] = ROLE_OPERATIVE
+        if x < INITIATE_EXIT_XP:
+            out[uid] = ROLE_INITIATE
+        elif uid in topA:
+            out[uid] = ROLE_ASCENDANT
+        elif uid in nextE:
+            out[uid] = ROLE_EMBER
+        else:
+            out[uid] = ROLE_OPERATIVE
     return out
 
-def display_rank(m, computed):
+def display_rank(m: discord.Member, computed: str) -> str:
     return f"{MANUAL_PRIME_ROLE} + {computed}" if has_prime(m) else computed
 
 # -------------------------
 # ROLE SYNC (DEBOUNCED)
 # -------------------------
-_role_sync_tasks = {}
+_role_sync_tasks: dict[int, asyncio.Task] = {}
 
-async def request_role_sync(guild):
+async def request_role_sync(guild: discord.Guild):
     if guild.id in _role_sync_tasks:
         return
 
     async def runner():
         await asyncio.sleep(ROLE_SYNC_DEBOUNCE_SECONDS)
-        await sync_all_roles(guild)
-        _role_sync_tasks.pop(guild.id, None)
+        try:
+            await sync_all_roles(guild)
+        finally:
+            _role_sync_tasks.pop(guild.id, None)
 
     _role_sync_tasks[guild.id] = asyncio.create_task(runner())
 
-async def sync_all_roles(guild):
+async def sync_all_roles(guild: discord.Guild):
     roles = {r.name: r for r in guild.roles}
     managed = [roles[n] for n in ROLE_NAMES if n in roles]
 
     members = await fetch_members(guild)
-    rank_map = compute_rank_map(guild.id, list(members.keys()))
+    ids = list(members.keys())
+    rank_map = compute_rank_map(guild.id, ids)
 
     ok = failed = 0
     for uid, m in members.items():
-        target = roles.get(rank_map.get(uid, ROLE_INITIATE))
-        if not target:
+        target_role = roles.get(rank_map.get(uid, ROLE_INITIATE))
+        if not target_role:
             failed += 1
             continue
         try:
-            to_remove = [r for r in managed if r in m.roles and r != target]
+            to_remove = [r for r in managed if r in m.roles and r != target_role]
             if to_remove:
-                await m.remove_roles(*to_remove)
-            if target not in m.roles:
-                await m.add_roles(target)
+                await m.remove_roles(*to_remove, reason="Rank sync")
+            if target_role not in m.roles:
+                await m.add_roles(target_role, reason="Rank sync")
             ok += 1
-        except:
+        except Exception:
             failed += 1
     return ok, failed
 
 # -------------------------
-# STARTUP AUDIT (SLOW)
+# STARTUP AUDIT (SLOW + THROTTLED)
 # -------------------------
 async def silent_startup_audit():
     for guild in bot.guilds:
@@ -212,18 +232,23 @@ async def silent_startup_audit():
             if meta_get(c, key) == "1":
                 continue
             meta_set(c, key, "1")
+            reset_audit_state(c, guild.id)
             c.commit()
 
         cutoff = datetime.utcnow() - timedelta(days=STARTUP_AUDIT_DAYS)
-        scanned = 0
+        throttle = 0
 
         with db() as c:
             for ch in guild.text_channels:
-                perms = ch.permissions_for(guild.me)
+                me = guild.me
+                if not me:
+                    continue
+                perms = ch.permissions_for(me)
                 if not perms.view_channel or not perms.read_message_history:
                     continue
+
                 try:
-                 async for msg in ch.history(after=cutoff, oldest_first=True, limit=None):
+                    async for msg in ch.history(after=cutoff, oldest_first=True, limit=None):
                         if msg.author.bot:
                             continue
                         if len((msg.content or "").strip()) < MIN_MESSAGE_CHARS:
@@ -231,17 +256,19 @@ async def silent_startup_audit():
 
                         ts = int(msg.created_at.timestamp())
                         u = get_user(c, guild.id, msg.author.id)
-                        if ts < u["chat_cooldown"]:
+                        if ts < int(u["chat_cooldown"]):
                             continue
 
-                        award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
-                        scanned += 1
+                        gained = award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
+                        if gained:
+                            c.execute("UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                                      (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id))
 
-                        if scanned % AUDIT_SLEEP_EVERY_MSGS == 0:
+                        throttle += 1
+                        if throttle % AUDIT_SLEEP_EVERY_MSGS == 0:
                             c.commit()
                             await asyncio.sleep(AUDIT_SLEEP_SECONDS)
-
-                except:
+                except Exception:
                     pass
 
             c.commit()
@@ -261,7 +288,7 @@ async def on_ready():
     print("Ready:", bot.user)
 
 @bot.event
-async def on_message(msg):
+async def on_message(msg: discord.Message):
     if msg.author.bot or not msg.guild:
         return
     await bot.process_commands(msg)
@@ -272,7 +299,7 @@ async def on_message(msg):
     ts = now()
     with db() as c:
         u = get_user(c, msg.guild.id, msg.author.id)
-        if ts < u["chat_cooldown"]:
+        if ts < int(u["chat_cooldown"]):
             return
 
         gained = award_xp(c, msg.guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
@@ -303,7 +330,7 @@ async def vc_xp_loop():
                         continue
 
                     u = get_user(c, guild.id, m.id)
-                    minutes = u["vc_minutes"] + 1
+                    minutes = int(u["vc_minutes"]) + 1
 
                     if minutes >= VC_MINUTES_PER_XP:
                         if award_xp(c, guild.id, m.id, 1, ts):
@@ -312,7 +339,6 @@ async def vc_xp_loop():
 
                     c.execute("UPDATE users SET vc_minutes=? WHERE guild_id=? AND user_id=?",
                               (minutes, guild.id, m.id))
-
                 c.commit()
 
         if any_gain:
@@ -324,7 +350,6 @@ async def vc_xp_loop():
 @tasks.loop(hours=24)
 async def decay_loop():
     cutoff = now() - DECAY_GRACE_HOURS * 3600
-
     for guild in bot.guilds:
         changed = False
         with db() as c:
@@ -332,8 +357,8 @@ async def decay_loop():
                              (guild.id,)).fetchall()
 
             for r in rows:
-                xp = r["xp"]
-                if xp <= 0 or r["last_active"] >= cutoff:
+                xp = int(r["xp"])
+                if xp <= 0 or int(r["last_active"]) >= cutoff:
                     continue
 
                 loss = max(int(xp * DECAY_PERCENT_PER_DAY), DECAY_MIN_XP_PER_DAY)
@@ -343,7 +368,7 @@ async def decay_loop():
 
                 if new_xp != xp:
                     c.execute("UPDATE users SET xp=? WHERE guild_id=? AND user_id=?",
-                              (new_xp, guild.id, r["user_id"]))
+                              (new_xp, guild.id, int(r["user_id"])))
                     changed = True
 
             c.commit()
@@ -361,7 +386,6 @@ async def standing(interaction: discord.Interaction):
 
     guild = interaction.guild
     me = interaction.user
-
     await interaction.response.defer(ephemeral=True)
 
     members = await fetch_members(guild)
@@ -380,18 +404,16 @@ async def standing(interaction: discord.Interaction):
 
     place = total = myxp = 0
     for r in rows:
-        uid = r["user_id"]
+        uid = int(r["user_id"])
         if uid not in members:
             continue
         total += 1
         if uid == me.id:
             place = total
-            myxp = r["xp"]
+            myxp = int(r["xp"])
 
     await interaction.followup.send(
-        f"📊 Standing\n"
-        f"Place: #{place}/{total}\n"
-        f"XP: {myxp}/{MAX_XP}\n"
+        f"📊 Standing\nPlace: #{place}/{total}\nXP: {myxp}/{MAX_XP}\n"
         f"Tier: {display_rank(me, rank_map.get(me.id, ROLE_INITIATE))}",
         ephemeral=True
     )
@@ -421,12 +443,12 @@ async def leaderboard(interaction: discord.Interaction, announce: bool = False):
 
     lines, place = [], 0
     for r in rows:
-        uid = r["user_id"]
+        uid = int(r["user_id"])
         if uid not in members:
             continue
         place += 1
         m = members[uid]
-        xp = r["xp"]
+        xp = int(r["xp"])
         lines.append(f"{place:>4}. {m.display_name} — {xp} XP — {display_rank(m, rank_map.get(uid, ROLE_INITIATE))}")
 
     preview = "\n".join(lines[:30]) if lines else "No users."
@@ -445,41 +467,52 @@ async def audit(interaction: discord.Interaction, days: int = 30, announce: bool
 
     guild = interaction.guild
     cutoff = datetime.utcnow() - timedelta(days=days)
-
     await interaction.response.defer(ephemeral=not announce)
 
-    scanned = awarded = skipped = 0
-    throttle = 0
-
+    scanned = awarded = skipped = throttle = 0
     with db() as c:
+        reset_audit_state(c, guild.id)
+        c.commit()
+
         for ch in guild.text_channels:
-            perms = ch.permissions_for(guild.me)
+            me = guild.me
+            if not me:
+                continue
+            perms = ch.permissions_for(me)
             if not perms.view_channel or not perms.read_message_history:
                 skipped += 1
                 continue
 
             try:
-                    async for msg in ch.history(after=cutoff, oldest_first=True, limit=None):
+                async for msg in ch.history(after=cutoff, oldest_first=True, limit=None):
                     scanned += 1
                     if msg.author.bot:
                         continue
                     if len((msg.content or "").strip()) < MIN_MESSAGE_CHARS:
                         continue
 
-                    awarded += award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK,
-                                       ts=int(msg.created_at.timestamp()))
+                    ts = int(msg.created_at.timestamp())
+                    u = get_user(c, guild.id, msg.author.id)
+                    if ts < int(u["chat_cooldown"]):
+                        continue
+
+                    gained = award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
+                    if gained:
+                        awarded += gained
+                        c.execute("UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                                  (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id))
+
                     throttle += 1
                     if throttle % AUDIT_SLEEP_EVERY_MSGS == 0:
                         c.commit()
                         await asyncio.sleep(AUDIT_SLEEP_SECONDS)
 
-            except:
+            except Exception:
                 skipped += 1
 
         c.commit()
 
     ok, failed = await sync_all_roles(guild)
-
     await interaction.followup.send(
         f"Audit complete\nDays: {days}\nScanned: {scanned}\nAwarded XP: {awarded}\n"
         f"Role Sync: {ok}/{failed}\nSkipped Channels: {skipped}",
@@ -504,26 +537,20 @@ async def resetranks(interaction: discord.Interaction, member: discord.Member | 
     with db() as c:
         for uid in targets:
             u = get_user(c, guild.id, uid)
-            old = u["xp"]
+            old = int(u["xp"])
             new = old if old < INITIATE_EXIT_XP else INITIATE_EXIT_XP
             if new != old:
                 changed += 1
-
             c.execute("""
                 UPDATE users
-                SET xp=?, last_active=0, chat_cooldown=0,
-                    last_minute=0, earned_this_minute=0, vc_minutes=0
+                SET xp=?, last_active=0, chat_cooldown=0, last_minute=0,
+                    earned_this_minute=0, vc_minutes=0
                 WHERE guild_id=? AND user_id=?
             """, (new, guild.id, uid))
-
         c.commit()
 
     ok, failed = await sync_all_roles(guild)
-
-    await interaction.followup.send(
-        f"Reset complete\nChanged XP: {changed}\nRole Sync: {ok}/{failed}",
-        ephemeral=True
-    )
+    await interaction.followup.send(f"Reset complete\nChanged XP: {changed}\nRole Sync: {ok}/{failed}", ephemeral=True)
 
 @bot.tree.command(name="setxp")
 @app_commands.describe(member="User", xp="New XP", announce="Public?")
@@ -540,18 +567,14 @@ async def setxp(interaction: discord.Interaction, member: discord.Member, xp: in
         get_user(c, interaction.guild.id, member.id)
         c.execute("""
             UPDATE users
-            SET xp=?, last_active=?, chat_cooldown=0,
-                last_minute=0, earned_this_minute=0, vc_minutes=0
+            SET xp=?, last_active=?, chat_cooldown=0, last_minute=0,
+                earned_this_minute=0, vc_minutes=0
             WHERE guild_id=? AND user_id=?
         """, (xp, now(), interaction.guild.id, member.id))
         c.commit()
 
     ok, failed = await sync_all_roles(interaction.guild)
-
-    await interaction.followup.send(
-        f"Set {member.display_name} → {xp} XP\nSync {ok}/{failed}",
-        ephemeral=not announce
-    )
+    await interaction.followup.send(f"Set {member.display_name} → {xp} XP\nSync {ok}/{failed}", ephemeral=not announce)
 
 # -------------------------
 # RUN
@@ -559,5 +582,4 @@ async def setxp(interaction: discord.Interaction, member: discord.Member, xp: in
 token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise RuntimeError("DISCORD_TOKEN missing")
-
 bot.run(token)
