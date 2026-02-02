@@ -459,7 +459,7 @@ async def audit(interaction: discord.Interaction, days: int = 30, announce: bool
                 continue
 
             try:
-                async for msg in ch.history(after=cutoff, oldest_first=True):
+                    async for msg in ch.history(after=cutoff, oldest_first=True, limit=None):
                     scanned += 1
                     if msg.author.bot:
                         continue
