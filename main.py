@@ -237,7 +237,6 @@ async def sync_all_roles(guild: discord.Guild):
 # STARTUP AUDIT (SLOW + THROTTLED)
 # -------------------------
 async def silent_startup_audit():
-    # One guild at a time + DB lock prevents crashing if you run /audit early
     for guild in bot.guilds:
         key = f"startup_audit_done:{guild.id}"
 
@@ -278,7 +277,7 @@ async def silent_startup_audit():
                             if gained:
                                 c.execute(
                                     "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
-                                    (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id)
+                                    (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id),
                                 )
 
                             throttle += 1
@@ -298,24 +297,34 @@ async def silent_startup_audit():
 class NotifyModal(discord.ui.Modal, title="Build Announcement"):
     title_in = discord.ui.TextInput(label="Title", max_length=80, placeholder="Short title")
     body_in = discord.ui.TextInput(label="Body", style=discord.TextStyle.paragraph, max_length=2000)
+    note_in = discord.ui.TextInput(
+        label="Note (optional)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=400,
+        placeholder="Shows as -# note text",
+    )
 
     def __init__(self):
         super().__init__()
         self.title_value = ""
         self.body_value = ""
+        self.note_value = ""
 
     async def on_submit(self, interaction: discord.Interaction):
         self.title_value = str(self.title_in.value).strip()
         self.body_value = str(self.body_in.value).strip()
+        self.note_value = str(self.note_in.value).strip() if self.note_in.value else ""
         await interaction.response.defer(ephemeral=True)
 
 class NotifyView(discord.ui.View):
-    def __init__(self, author_id: int, channel: discord.TextChannel, title: str, body: str):
+    def __init__(self, author_id: int, channel: discord.TextChannel, title: str, body: str, note: str = ""):
         super().__init__(timeout=600)
         self.author_id = author_id
         self.channel = channel
         self.title = title
         self.body = body
+        self.note = note.strip() if note else ""
         self.ping_mode = "none"
         self.role: discord.Role | None = None
 
@@ -355,7 +364,10 @@ class NotifyView(discord.ui.View):
 
     def render(self) -> str:
         ping = self._ping_text()
-        return f"{(ping + chr(10)) if ping else ''}# {self.title}\n{self.body}"
+        msg = f"{(ping + chr(10)) if ping else ''}# {self.title}\n{self.body}"
+        if self.note:
+            msg += f"\n-# {self.note}"
+        return msg
 
     async def _on_ping_mode(self, interaction: discord.Interaction):
         self.ping_mode = self._ping_select.values[0]
@@ -404,7 +416,7 @@ async def notify(interaction: discord.Interaction):
     if not modal.title_value or not modal.body_value:
         return
 
-    view = NotifyView(interaction.user.id, ch, modal.title_value, modal.body_value)
+    view = NotifyView(interaction.user.id, ch, modal.title_value, modal.body_value, modal.note_value)
     await interaction.followup.send(
         "📝 **Preview (private)** — press **Post** to send:\n\n" + view.render(),
         view=view,
@@ -418,8 +430,10 @@ async def notify(interaction: discord.Interaction):
 async def on_ready():
     init_db()
     await bot.tree.sync()
-    decay_loop.start()
-    vc_xp_loop.start()
+    if not decay_loop.is_running():
+        decay_loop.start()
+    if not vc_xp_loop.is_running():
+        vc_xp_loop.start()
     await silent_startup_audit()
     print("Ready:", bot.user)
 
