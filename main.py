@@ -43,6 +43,8 @@ STARTUP_AUDIT_DAYS = 365
 AUDIT_SLEEP_EVERY_MSGS = 250
 AUDIT_SLEEP_SECONDS = 1
 
+ANNOUNCE_CHANNEL_NAME = "📢announcements"
+
 # -------------------------
 # DISCORD
 # -------------------------
@@ -132,6 +134,9 @@ async def fetch_members(guild: discord.Guild) -> dict[int, discord.Member]:
         if not m.bot:
             out[m.id] = m
     return out
+
+def get_announce_channel(guild: discord.Guild):
+    return discord.utils.get(guild.text_channels, name=ANNOUNCE_CHANNEL_NAME)
 
 # -------------------------
 # XP CORE
@@ -271,8 +276,10 @@ async def silent_startup_audit():
 
                             gained = award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
                             if gained:
-                                c.execute("UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
-                                          (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id))
+                                c.execute(
+                                    "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                                    (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id)
+                                )
 
                             throttle += 1
                             if throttle % AUDIT_SLEEP_EVERY_MSGS == 0:
@@ -284,6 +291,125 @@ async def silent_startup_audit():
                 c.commit()
 
         await sync_all_roles(guild)
+
+# -------------------------
+# NOTIFY (Prime-only, private preview -> posts to 📢announcements)
+# -------------------------
+class NotifyModal(discord.ui.Modal, title="Build Announcement"):
+    title_in = discord.ui.TextInput(label="Title", max_length=80, placeholder="Short title")
+    body_in = discord.ui.TextInput(label="Body", style=discord.TextStyle.paragraph, max_length=2000)
+
+    def __init__(self):
+        super().__init__()
+        self.title_value = ""
+        self.body_value = ""
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.title_value = str(self.title_in.value).strip()
+        self.body_value = str(self.body_in.value).strip()
+        await interaction.response.defer(ephemeral=True)
+
+class NotifyView(discord.ui.View):
+    def __init__(self, author_id: int, channel: discord.TextChannel, title: str, body: str):
+        super().__init__(timeout=600)
+        self.author_id = author_id
+        self.channel = channel
+        self.title = title
+        self.body = body
+        self.ping_mode = "none"
+        self.role: discord.Role | None = None
+
+        ping_select = discord.ui.Select(
+            placeholder="Ping mode",
+            options=[
+                discord.SelectOption(label="No ping", value="none"),
+                discord.SelectOption(label="@here", value="here"),
+                discord.SelectOption(label="@everyone", value="everyone"),
+                discord.SelectOption(label="Role ping", value="role"),
+            ],
+        )
+        ping_select.callback = self._on_ping_mode
+        self.add_item(ping_select)
+        self._ping_select = ping_select
+
+        role_select = discord.ui.RoleSelect(
+            placeholder="Role (only used if Role ping)",
+            min_values=0,
+            max_values=1,
+        )
+        role_select.callback = self._on_role
+        self.add_item(role_select)
+        self._role_select = role_select
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.author_id
+
+    def _ping_text(self) -> str:
+        if self.ping_mode == "here":
+            return "@here"
+        if self.ping_mode == "everyone":
+            return "@everyone"
+        if self.ping_mode == "role" and self.role:
+            return self.role.mention
+        return ""
+
+    def render(self) -> str:
+        ping = self._ping_text()
+        return f"{(ping + chr(10)) if ping else ''}# {self.title}\n{self.body}"
+
+    async def _on_ping_mode(self, interaction: discord.Interaction):
+        self.ping_mode = self._ping_select.values[0]
+        await interaction.response.edit_message(
+            content="📝 **Preview (private)** — press **Post** to send:\n\n" + self.render(),
+            view=self,
+        )
+
+    async def _on_role(self, interaction: discord.Interaction):
+        self.role = self._role_select.values[0] if self._role_select.values else None
+        await interaction.response.edit_message(
+            content="📝 **Preview (private)** — press **Post** to send:\n\n" + self.render(),
+            view=self,
+        )
+
+    @discord.ui.button(label="Post", style=discord.ButtonStyle.green)
+    async def post(self, interaction: discord.Interaction, _):
+        try:
+            await self.channel.send(self.render(), allowed_mentions=discord.AllowedMentions.all())
+            await interaction.response.edit_message(content="✅ Posted to 📢announcements.", view=None)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed: `{e}`", ephemeral=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
+    async def cancel(self, interaction: discord.Interaction, _):
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+@bot.tree.command(name="notify")
+async def notify(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("Guild only.", ephemeral=True)
+    if not is_admin(interaction):
+        return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
+
+    ch = get_announce_channel(interaction.guild)
+    if not ch:
+        return await interaction.response.send_message(
+            f"Can't find channel named `{ANNOUNCE_CHANNEL_NAME}`.",
+            ephemeral=True,
+        )
+
+    modal = NotifyModal()
+    await interaction.response.send_modal(modal)
+    await modal.wait()
+
+    if not modal.title_value or not modal.body_value:
+        return
+
+    view = NotifyView(interaction.user.id, ch, modal.title_value, modal.body_value)
+    await interaction.followup.send(
+        "📝 **Preview (private)** — press **Post** to send:\n\n" + view.render(),
+        view=view,
+        ephemeral=True,
+    )
 
 # -------------------------
 # EVENTS
@@ -314,8 +440,10 @@ async def on_message(msg: discord.Message):
                 return
 
             gained = award_xp(c, msg.guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
-            c.execute("UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
-                      (ts + CHAT_COOLDOWN_SECONDS, msg.guild.id, msg.author.id))
+            c.execute(
+                "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                (ts + CHAT_COOLDOWN_SECONDS, msg.guild.id, msg.author.id),
+            )
             c.commit()
 
     if gained:
@@ -349,8 +477,10 @@ async def vc_xp_loop():
                                 any_gain = True
                             minutes = 0
 
-                        c.execute("UPDATE users SET vc_minutes=? WHERE guild_id=? AND user_id=?",
-                                  (minutes, guild.id, m.id))
+                        c.execute(
+                            "UPDATE users SET vc_minutes=? WHERE guild_id=? AND user_id=?",
+                            (minutes, guild.id, m.id),
+                        )
 
                 c.commit()
 
@@ -368,8 +498,10 @@ async def decay_loop():
 
         async with DB_LOCK:
             with db() as c:
-                rows = c.execute("SELECT user_id, xp, last_active FROM users WHERE guild_id=?",
-                                 (guild.id,)).fetchall()
+                rows = c.execute(
+                    "SELECT user_id, xp, last_active FROM users WHERE guild_id=?",
+                    (guild.id,),
+                ).fetchall()
 
                 for r in rows:
                     xp = int(r["xp"])
@@ -382,8 +514,10 @@ async def decay_loop():
                         new_xp = max(DECAY_FLOOR_XP, new_xp)
 
                     if new_xp != xp:
-                        c.execute("UPDATE users SET xp=? WHERE guild_id=? AND user_id=?",
-                                  (new_xp, guild.id, int(r["user_id"])))
+                        c.execute(
+                            "UPDATE users SET xp=? WHERE guild_id=? AND user_id=?",
+                            (new_xp, guild.id, int(r["user_id"])),
+                        )
                         changed = True
 
                 c.commit()
@@ -431,7 +565,7 @@ async def standing(interaction: discord.Interaction):
     await interaction.followup.send(
         f"📊 Standing\nPlace: #{place}/{total}\nXP: {myxp}/{MAX_XP}\n"
         f"Tier: {display_rank(me, rank_map.get(me.id, ROLE_INITIATE))}",
-        ephemeral=True
+        ephemeral=True,
     )
 
 @bot.tree.command(name="leaderboard")
@@ -466,7 +600,9 @@ async def leaderboard(interaction: discord.Interaction, announce: bool = False):
         place += 1
         m = members[uid]
         xp = int(r["xp"])
-        lines.append(f"{place:>4}. {m.display_name} — {xp} XP — {display_rank(m, rank_map.get(uid, ROLE_INITIATE))}")
+        lines.append(
+            f"{place:>4}. {m.display_name} — {xp} XP — {display_rank(m, rank_map.get(uid, ROLE_INITIATE))}"
+        )
 
     preview = "\n".join(lines[:30]) if lines else "No users."
     file = discord.File(fp=io.BytesIO("\n".join(lines).encode()), filename="leaderboard.txt")
@@ -518,8 +654,10 @@ async def audit(interaction: discord.Interaction, days: int = 30, announce: bool
                         gained = award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
                         if gained:
                             awarded += gained
-                            c.execute("UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
-                                      (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id))
+                            c.execute(
+                                "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                                (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id),
+                            )
 
                         throttle += 1
                         if throttle % AUDIT_SLEEP_EVERY_MSGS == 0:
@@ -535,7 +673,7 @@ async def audit(interaction: discord.Interaction, days: int = 30, announce: bool
     await interaction.followup.send(
         f"Audit complete\nDays: {days}\nScanned: {scanned}\nAwarded XP: {awarded}\n"
         f"Role Sync: {ok}/{failed}\nSkipped Channels: {skipped}",
-        ephemeral=not announce
+        ephemeral=not announce,
     )
 
 @bot.tree.command(name="resetranks")
@@ -571,7 +709,10 @@ async def resetranks(interaction: discord.Interaction, member: discord.Member | 
             c.commit()
 
     ok, failed = await sync_all_roles(guild)
-    await interaction.followup.send(f"Reset complete\nChanged XP: {changed}\nRole Sync: {ok}/{failed}", ephemeral=True)
+    await interaction.followup.send(
+        f"Reset complete\nChanged XP: {changed}\nRole Sync: {ok}/{failed}",
+        ephemeral=True,
+    )
 
 @bot.tree.command(name="setxp")
 @app_commands.describe(member="User", xp="New XP", announce="Public?")
@@ -596,7 +737,10 @@ async def setxp(interaction: discord.Interaction, member: discord.Member, xp: in
             c.commit()
 
     ok, failed = await sync_all_roles(interaction.guild)
-    await interaction.followup.send(f"Set {member.display_name} → {xp} XP\nSync {ok}/{failed}", ephemeral=not announce)
+    await interaction.followup.send(
+        f"Set {member.display_name} → {xp} XP\nSync {ok}/{failed}",
+        ephemeral=not announce,
+    )
 
 # -------------------------
 # RUN
