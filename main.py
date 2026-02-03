@@ -365,6 +365,10 @@ async def silent_startup_audit():
 
 # -------------------------
 # NOTIFY (Prime-only, private preview -> posts to 📢announcements, optional DM)
+# DM rules:
+# - DM option exists ONLY for @everyone and Role ping
+# - Role must be selected each time (switching away from role clears it)
+# - @everyone DM requires confirm when enabling AND confirm again when posting
 # -------------------------
 def _ping_label(mode: str) -> str:
     return {"here": "@here", "everyone": "@everyone", "role": "Role"}.get(mode, "No ping")
@@ -372,8 +376,12 @@ def _ping_label(mode: str) -> str:
 class NotifyModal(discord.ui.Modal, title="Build Announcement"):
     def __init__(self, title_default: str = "", body_default: str = "", note_default: str = ""):
         super().__init__()
-        self.title_in = discord.ui.TextInput(label="Title", max_length=80, placeholder="Short title", default=title_default)
-        self.body_in = discord.ui.TextInput(label="Body", style=discord.TextStyle.paragraph, max_length=2000, default=body_default)
+        self.title_in = discord.ui.TextInput(
+            label="Title", max_length=80, placeholder="Short title", default=title_default
+        )
+        self.body_in = discord.ui.TextInput(
+            label="Body", style=discord.TextStyle.paragraph, max_length=2000, default=body_default
+        )
         self.note_in = discord.ui.TextInput(
             label="Note (optional)",
             style=discord.TextStyle.paragraph,
@@ -397,9 +405,8 @@ class NotifyModal(discord.ui.Modal, title="Build Announcement"):
         await interaction.response.defer(ephemeral=True)
 
 class EveryoneConfirmModal(discord.ui.Modal, title="Confirm DM @everyone"):
-    def __init__(self, prompt: str):
+    def __init__(self):
         super().__init__()
-        self.prompt = prompt
         self.confirm_in = discord.ui.TextInput(
             label='Type "EVERYONE" to confirm',
             max_length=16,
@@ -425,8 +432,8 @@ class NotifyView(discord.ui.View):
         self.ping_mode = "none"   # none/here/everyone/role
         self.role: discord.Role | None = None
 
-        self.dm_enabled = False   # DM the ping audience (only available if ping set)
-        self.dm_everyone_armed = False  # "armed" state after confirm
+        self.dm_enabled = False
+        self.dm_everyone_armed = False
 
         self._ping_select = discord.ui.Select(
             placeholder="Ping mode",
@@ -448,14 +455,17 @@ class NotifyView(discord.ui.View):
         self._role_select.callback = self._on_role
         self.add_item(self._role_select)
 
-        # DM toggle button is added/removed dynamically (only when ping is active)
         self._dm_button = discord.ui.Button(label="DM pinged users: OFF", style=discord.ButtonStyle.secondary)
         self._dm_button.callback = self._toggle_dm
 
+        self._apply_role_select_state()
         self._refresh_dm_button()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.author_id
+
+    def _apply_role_select_state(self):
+        self._role_select.disabled = (self.ping_mode != "role")
 
     def _ping_text(self) -> str:
         if self.ping_mode == "here":
@@ -466,8 +476,12 @@ class NotifyView(discord.ui.View):
             return self.role.mention
         return ""
 
+    def _dm_allowed(self) -> bool:
+        # Only everyone + role can DM (per your rule)
+        return self.ping_mode in ("everyone", "role")
+
     def _dm_audience_ok(self) -> bool:
-        if self.ping_mode in ("here", "everyone"):
+        if self.ping_mode == "everyone":
             return True
         if self.ping_mode == "role":
             return self.role is not None
@@ -485,39 +499,34 @@ class NotifyView(discord.ui.View):
 
     def _preview_header(self) -> str:
         ping = _ping_label(self.ping_mode)
-        dm = "ON" if self.dm_enabled else "OFF"
-        extra = ""
-        if self.ping_mode != "none":
-            extra = f"\nPing: **{ping}** | DM ping: **{dm}**"
-            if self.ping_mode == "role" and self.role:
-                extra += f" ({self.role.name})"
+        extra = f"\nPing: **{ping}**"
+        if self.ping_mode == "role" and self.role:
+            extra += f" (**{self.role.name}**)"
+        if self._dm_allowed():
+            extra += f" | DM: **{'ON' if self.dm_enabled else 'OFF'}**"
         return "📝 **Preview (private)** — Edit / Post / Cancel" + extra + "\n\n"
 
     def _refresh_dm_button(self):
-        # remove if present
         if self._dm_button in self.children:
             self.remove_item(self._dm_button)
 
-        # Only show DM option when ping is not none
-        if self.ping_mode == "none":
+        if not self._dm_allowed():
             self.dm_enabled = False
             self.dm_everyone_armed = False
             return
 
-        # Also require role selected if role ping (otherwise DM toggle still visible but blocked)
-        label = f"DM pinged users: {'ON' if self.dm_enabled else 'OFF'}"
-        if self.ping_mode == "everyone" and self.dm_enabled:
-            label = "DM @everyone: ON"
-        elif self.ping_mode == "everyone" and not self.dm_enabled:
-            label = "DM @everyone: OFF"
+        # label + style
+        if self.ping_mode == "everyone":
+            self._dm_button.label = f"DM @everyone: {'ON' if self.dm_enabled else 'OFF'}"
+            self._dm_button.style = discord.ButtonStyle.danger if self.dm_enabled else discord.ButtonStyle.secondary
+        else:
+            self._dm_button.label = f"DM role: {'ON' if self.dm_enabled else 'OFF'}"
+            self._dm_button.style = discord.ButtonStyle.success if self.dm_enabled else discord.ButtonStyle.secondary
 
-        self._dm_button.label = label
-        self._dm_button.style = discord.ButtonStyle.danger if (self.ping_mode == "everyone" and self.dm_enabled) else (
-            discord.ButtonStyle.success if self.dm_enabled else discord.ButtonStyle.secondary
-        )
         self.add_item(self._dm_button)
 
     async def _rerender(self, interaction: discord.Interaction):
+        self._apply_role_select_state()
         self._refresh_dm_button()
         await interaction.response.edit_message(
             content=self._preview_header() + self.render(),
@@ -530,6 +539,8 @@ class NotifyView(discord.ui.View):
         # Reset DM state on ping mode change
         self.dm_enabled = False
         self.dm_everyone_armed = False
+
+        # Role must be re-selected each time (clears when leaving role mode)
         if self.ping_mode != "role":
             self.role = None
 
@@ -537,27 +548,29 @@ class NotifyView(discord.ui.View):
 
     async def _on_role(self, interaction: discord.Interaction):
         self.role = self._role_select.values[0] if self._role_select.values else None
-        # If role is cleared, also disable DM (since audience becomes invalid)
+
+        # If role cleared, DM becomes invalid -> OFF
         if self.ping_mode == "role" and not self.role:
             self.dm_enabled = False
+
         await self._rerender(interaction)
 
     async def _toggle_dm(self, interaction: discord.Interaction):
-        if self.ping_mode == "none":
-            return await interaction.response.send_message("Pick a ping first.", ephemeral=True)
+        if not self._dm_allowed():
+            return await interaction.response.send_message("DM is only available for @everyone or Role ping.", ephemeral=True)
 
         if not self._dm_audience_ok():
             return await interaction.response.send_message("Pick a role first (Role ping).", ephemeral=True)
 
-        # Turning OFF is always immediate
+        # OFF is immediate
         if self.dm_enabled:
             self.dm_enabled = False
             self.dm_everyone_armed = False
             return await self._rerender(interaction)
 
-        # Turning ON for @everyone requires confirm modal
+        # ON: @everyone needs confirm
         if self.ping_mode == "everyone":
-            modal = EveryoneConfirmModal('You are about to DM **everyone** in the server.')
+            modal = EveryoneConfirmModal()
             await interaction.response.send_modal(modal)
             await modal.wait()
             if not modal.ok:
@@ -569,10 +582,16 @@ class NotifyView(discord.ui.View):
                 "✅ DM @everyone ARMED. Posting will require confirmation again.",
                 ephemeral=True,
             )
-            # Need a message edit too
-            return await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+            # Update the preview message
+            try:
+                self._apply_role_select_state()
+                self._refresh_dm_button()
+                await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+            except Exception:
+                pass
+            return
 
-        # here/role: no extra confirm
+        # Role: no extra confirm
         self.dm_enabled = True
         await self._rerender(interaction)
 
@@ -582,9 +601,6 @@ class NotifyView(discord.ui.View):
 
         if self.ping_mode == "everyone":
             return [m for m in ms if not m.bot]
-        if self.ping_mode == "here":
-            # status != offline
-            return [m for m in ms if (not m.bot and m.status != discord.Status.offline)]
         if self.ping_mode == "role" and self.role:
             return [m for m in ms if (not m.bot and self.role in m.roles)]
         return []
@@ -598,8 +614,7 @@ class NotifyView(discord.ui.View):
                 sent += 1
             except Exception:
                 failed += 1
-            # gentle throttle
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.6)  # gentle throttle
         return sent, failed
 
     @discord.ui.button(label="Edit", style=discord.ButtonStyle.blurple)
@@ -615,12 +630,17 @@ class NotifyView(discord.ui.View):
         self.body = modal.body_value
         self.note = modal.note_value
 
-        # Rerender message
         try:
             await interaction.followup.send("✅ Updated preview.", ephemeral=True)
         except Exception:
             pass
-        return await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+
+        try:
+            self._apply_role_select_state()
+            self._refresh_dm_button()
+            await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+        except Exception:
+            pass
 
     @discord.ui.button(label="Post", style=discord.ButtonStyle.green)
     async def post(self, interaction: discord.Interaction, _):
@@ -629,19 +649,24 @@ class NotifyView(discord.ui.View):
 
         # If DM @everyone is enabled, require second confirmation modal
         if self.dm_enabled and self.ping_mode == "everyone":
-            modal = EveryoneConfirmModal("Final check: you are about to DM **everyone**.")
+            modal = EveryoneConfirmModal()
             await interaction.response.send_modal(modal)
             await modal.wait()
             if not modal.ok:
                 return await interaction.followup.send("❌ Post cancelled (DM @everyone not confirmed).", ephemeral=True)
 
+        # Use defer so we can safely followup
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
         content = self.render()
 
         try:
-            # Post to channel
+            # Post to announcements channel
             await self.channel.send(content, allowed_mentions=discord.AllowedMentions.all())
 
-            # Optional DMs
             dm_report = ""
             if self.dm_enabled:
                 sent, failed = await self._send_dms(interaction.guild, content)
@@ -651,14 +676,14 @@ class NotifyView(discord.ui.View):
                 f"✅ Posted to {self.channel.mention}.{dm_report}",
                 ephemeral=True,
             )
-            # Clear the preview message
+
             try:
                 await interaction.message.edit(content="✅ Done.", view=None)
             except Exception:
                 pass
 
         except Exception as e:
-            await interaction.response.send_message(f"❌ Failed: `{e}`", ephemeral=True)
+            await interaction.followup.send(f"❌ Failed: `{e}`", ephemeral=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
     async def cancel(self, interaction: discord.Interaction, _):
