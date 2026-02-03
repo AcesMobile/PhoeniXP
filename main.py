@@ -46,6 +46,82 @@ AUDIT_SLEEP_SECONDS = 1
 ANNOUNCE_CHANNEL_NAME = "📢announcements"
 
 # -------------------------
+# /notify auto-bold list
+# -------------------------
+AUTO_BOLD_PHRASES = [
+    "Sol System","Super Earth","Mars","Barnard Sector","Fornskogur II","Veil","Marre IV","Midasburg",
+    "Darrowsport","Hydrofall Prime","Cancri Sector","Prosperity Falls","Cerberus IIIc","Effluvia",
+    "Seyshel Beach","Fort Sanctuary","Gothmar Sector","Okul VI","Solghast","Diluvia","Cantolus Sector",
+    "Kelvinor","Martyr’s Bay","Freedom Peak","Viridia Prime","Obari","Idun Sector","Wraith","Atrama",
+    "Myradesh","Maw","Kelvin Sector","Zegema Paradise","Fort Justice","New Kiruna","Igla","Emeria",
+    "Altus Sector","Pathfinder V","Klen Dahth II","Widow’s Harbor","New Haven","Pilen V","Celeste Sector",
+    "Sulfura","Nublaria I","Krakatwo","Ivis","Slif","Moradesh","Korpus Sector","Crucible","Volterra",
+    "Caramoor","Alta V","Inari","Gallux Sector","Kharst","Bashyr","Rasp","Acubens Prime","Adhara",
+    "Afoyay Bay","Morgon Sector","Myrium","Eukoria","Regnus","Mog","Rictus Sector","Valmox","Iro",
+    "Grafmere","Kerth Secundus","Parsh","Oasis","Genesis Prime","Saleria Sector","Calypso","Outpost 32",
+    "Reaf","Irulta","Meridian Sector","Emorath","Ilduna Prime","Baldrick Prime","Liberty Ridge",
+    "Sagan Sector","Oslo Station","Gunvald","Borea","Marspira Sector","Curia","Barabos","Fenmire","Tarsh",
+    "Mastia","Talus Sector","Shallus","Shelt","Gaellivare","Imber","Iptus Sector","Providence","Primordia",
+    "Krakabos","Iridica","Valgaard","Ratch","Orion Sector","Terrek","Azterra","Fort Union","Cirrus","Heeth",
+    "Angel’s Venture","Veld","Ursa Sector","Skaash","Acrab XI","Acrux IX","Gemma","Ferris Sector","Hadar",
+    "Haldus","Zea Rugosia","Herthon Secundus","Hanzo Sector","Heze Bay","Alairt III","Alamak VII",
+    "New Stockholm","Ain-5","Akira Sector","Alaraph","Alathfar XI","Andar","Asperoth Prime","Keid",
+    "Guang Sector","Elysian Meadows","Alderidge Cove","Bellatrix","Botein","Khandark","Tarragon Sector",
+    "East Iridium Trading Bay","Brink-2","Osupsam","Canopus","Bunda Secundus","Theseus Sector","The Weir",
+    "Kuper","Caph","Castor","Tien Kwan","Lastofe","Nanos Sector","Dolph","Julheim","Bekvam III","Duma Tyr",
+    "Hydra Sector","Aesir Pass","Vernen Wells","Menkent","Lacaille Sector","Lesath","Penta","Chort Bay",
+    "Choohe","Tanis Sector","Claorell","Vog–Sojoth","Clasa","Yed Prior","Zefia","Demiurg","Arturion Sector",
+    "Mortax Prime","Kirrik","Wilford Station","Arkturus","Pioneer II","Electra Bay","Deneb Secundus",
+    "Falstaff Sector","Bore Rock","Esker","Socorro III","Erson Sands","Umlaut Sector","Erata Prime",
+    "Fenrir III","Meridia","Turing","Borgus Sector","Ursica XI","Achird III","Achernar Secundus","Darius II",
+    "Alstrad Sector","Kneth Port","Klaka 5","Kraz","Andromeda Sector","Charbal-VII","Charon Prime","Martale",
+    "Marfark","Matar Bay","Mirin Sector","Hellmire","Nivel 43","Zagon Prime","Oshaune","Draco Sector",
+    "Crimsica","Estanu","Fori Prime","Jin Xi Sector","Acamar IV","Pandion-XXIV","Gacrux","Phact Bay",
+    "Gar Haren","Gatria","Sten Sector","Trandor","Peacock","Partion","Overgoe Prime","Azur Secundus",
+    "L’estrade Sector","Navi VII","Omicron","Nabatea Secundus","Gemstone Bluffs","Epsilon Phoencis VI",
+    "Enuliale","Disapora X","Hawking Sector","Mordia 9","Euphoria III","Skitter","Kuma","Gellert Sector",
+    "Minchir","Mintoria","Blistica","Zzaniah Prime","Zosma","Valdis Sector","Merga IV","Merak","Cyberstan",
+    "Aurora Bay","Mekbuda","Videmitarix Prime","Ymir Sector","Meissa","Wasat","X-45","Vega Bay","Wezen",
+    "Trigon Sector","Varylia 5","Choepessa IV","Ustotu","Troost","Vandalon IV","Xzar Sector","Mort",
+    "Pöpli IX","Ingmar","Mantes","Draupnir","Severin Sector","Maia","Malevelon Creek","Durgen","Ubanea",
+    "Tibit","Quintus Sector","Termadon","Stor Tha Prime","Spherion","Stout","Leng Secundus","Xi Tauri Sector",
+    "Skat Bay","Sirius","Siemnot","Shete","Omega Sector","Setia","Senge 23","Seasse","Hydrobius","Karlia",
+    "Rigel Sector","Rogue 5","RD-4","Hesoe Prime","Hort","Rirga Bay","Leo Sector","Ras Algethi","Propus",
+    "Halies Port","Haka","Farsight Sector","Prasa","Pollux 31","Polaris Prime","Pherkad Secundus","Grand Errant",
+]
+
+def auto_bold_phrases(text: str) -> str:
+    if not text:
+        return text
+    lowered = text.lower()
+
+    # Longest-first helps avoid bolding a smaller substring inside a longer phrase.
+    phrases = sorted(AUTO_BOLD_PHRASES, key=len, reverse=True)
+
+    for phrase in phrases:
+        p_lower = phrase.lower()
+        start = 0
+        while True:
+            idx = lowered.find(p_lower, start)
+            if idx == -1:
+                break
+            end = idx + len(phrase)
+
+            # Skip if already bolded (exact **phrase**)
+            if (
+                idx >= 2 and text[idx - 2:idx] == "**"
+                and end + 2 <= len(text) and text[end:end + 2] == "**"
+            ):
+                start = end
+                continue
+
+            text = text[:idx] + "**" + text[idx:end] + "**" + text[end:]
+            lowered = text.lower()
+            start = end + 4  # account for added ** **
+
+    return text
+
+# -------------------------
 # DISCORD
 # -------------------------
 intents = discord.Intents.default()
@@ -68,13 +144,11 @@ def minute_bucket(ts: int) -> int: return ts // 60
 def clamp_xp(x: int) -> int: return max(0, min(MAX_XP, int(x)))
 
 def db():
-    # timeout helps SQLite wait briefly instead of instantly erroring
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
-    # WAL = better concurrency for readers while a writer exists
     c.execute("PRAGMA journal_mode=WAL;")
     c.execute("PRAGMA synchronous=NORMAL;")
-    c.execute("PRAGMA busy_timeout=30000;")  # 30s
+    c.execute("PRAGMA busy_timeout=30000;")
     return c
 
 def init_db():
@@ -364,9 +438,12 @@ class NotifyView(discord.ui.View):
 
     def render(self) -> str:
         ping = self._ping_text()
-        msg = f"{(ping + chr(10)) if ping else ''}# {self.title}\n{self.body}"
-        if self.note:
-            msg += f"\n-# {self.note}"
+        title = auto_bold_phrases(self.title)
+        body = auto_bold_phrases(self.body)
+        note = auto_bold_phrases(self.note) if self.note else ""
+        msg = f"{(ping + chr(10)) if ping else ''}# {title}\n{body}"
+        if note:
+            msg += f"\n-# {note}"
         return msg
 
     async def _on_ping_mode(self, interaction: discord.Interaction):
