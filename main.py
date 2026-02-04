@@ -368,13 +368,6 @@ async def silent_startup_audit():
 
 # -------------------------
 # NOTIFY (Prime-only, private preview -> posts to selected channel, optional DM)
-# DM rules:
-# - DM option exists ONLY for @everyone and Role ping
-# - Role must be selected each time (switching away from role clears it)
-# - @everyone DM requires confirm when enabling AND confirm again when posting
-# Channel rules:
-# - Channel select always available (text channels)
-# - Defaults to 📢announcements if it exists, otherwise current channel
 # -------------------------
 def _ping_label(mode: str) -> str:
     return {"here": "@here", "everyone": "@everyone", "role": "Role"}.get(mode, "No ping")
@@ -441,12 +434,12 @@ class NotifyView(discord.ui.View):
         self.dm_enabled = False
         self.dm_everyone_armed = False
 
-        # Channel select (text channels only)
+        # Channel select (text + announcement channels)
         self._channel_select = discord.ui.ChannelSelect(
             placeholder="Post channel",
             min_values=1,
             max_values=1,
-            channel_types=[discord.ChannelType.text],
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
         )
         self._channel_select.callback = self._on_channel
         self.add_item(self._channel_select)
@@ -549,8 +542,12 @@ class NotifyView(discord.ui.View):
 
     async def _on_channel(self, interaction: discord.Interaction):
         ch = self._channel_select.values[0]
-        if isinstance(ch, discord.TextChannel):
-            self.channel = ch
+
+        # ChannelSelect can return TextChannel or AnnouncementChannel (news).
+        # If it can .send(), it's a valid post destination.
+        if hasattr(ch, "send"):
+            self.channel = ch  # type: ignore
+
         await self._rerender(interaction)
 
     async def _on_ping_mode(self, interaction: discord.Interaction):
@@ -672,9 +669,10 @@ class NotifyView(discord.ui.View):
         me = interaction.guild.me
         if me:
             perms = self.channel.permissions_for(me)
-            if not perms.send_messages:
+            if not perms.view_channel or not perms.send_messages:
                 return await interaction.response.send_message(
-                    f"❌ I can't post in {self.channel.mention} (missing Send Messages).", ephemeral=True
+                    f"❌ I can't post in {self.channel.mention} (missing View Channel / Send Messages).",
+                    ephemeral=True,
                 )
 
         try:
