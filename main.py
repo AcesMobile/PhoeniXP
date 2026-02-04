@@ -1,4 +1,4 @@
-import os, time, sqlite3, io, asyncio
+import os, time, sqlite3, io, asyncio, re
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -91,31 +91,33 @@ AUTO_BOLD_PHRASES = [
 ]
 
 def auto_bold_phrases(text: str) -> str:
+    """
+    Bold phrases ONLY when they appear as standalone tokens (not embedded in other words).
+    Standalone definition: not immediately preceded/followed by [A-Za-z0-9_].
+    """
     if not text:
         return text
-    lowered = text.lower()
+
     phrases = sorted(AUTO_BOLD_PHRASES, key=len, reverse=True)
 
     for phrase in phrases:
-        p_lower = phrase.lower()
-        start = 0
-        while True:
-            idx = lowered.find(p_lower, start)
-            if idx == -1:
-                break
-            end = idx + len(phrase)
+        if not phrase:
+            continue
 
-            # Skip if already bolded (exact **phrase**)
-            if (
-                idx >= 2 and text[idx - 2:idx] == "**"
-                and end + 2 <= len(text) and text[end:end + 2] == "**"
-            ):
-                start = end
-                continue
+        escaped = re.escape(phrase)
+        pattern = re.compile(rf"(?i)(?<![0-9A-Za-z_])({escaped})(?![0-9A-Za-z_])")
 
-            text = text[:idx] + "**" + text[idx:end] + "**" + text[end:]
-            lowered = text.lower()
-            start = end + 4  # account for added ** **
+        def repl(m: re.Match) -> str:
+            start, end = m.span(1)
+
+            # Skip if already bolded as **<match>**
+            if start >= 2 and end + 2 <= len(text):
+                if text[start - 2:start] == "**" and text[end:end + 2] == "**":
+                    return m.group(1)
+
+            return f"**{m.group(1)}**"
+
+        text = pattern.sub(repl, text)
 
     return text
 
@@ -477,7 +479,6 @@ class NotifyView(discord.ui.View):
         return ""
 
     def _dm_allowed(self) -> bool:
-        # Only everyone + role can DM (per your rule)
         return self.ping_mode in ("everyone", "role")
 
     def _dm_audience_ok(self) -> bool:
@@ -515,7 +516,6 @@ class NotifyView(discord.ui.View):
             self.dm_everyone_armed = False
             return
 
-        # label + style
         if self.ping_mode == "everyone":
             self._dm_button.label = f"DM @everyone: {'ON' if self.dm_enabled else 'OFF'}"
             self._dm_button.style = discord.ButtonStyle.danger if self.dm_enabled else discord.ButtonStyle.secondary
@@ -535,12 +535,9 @@ class NotifyView(discord.ui.View):
 
     async def _on_ping_mode(self, interaction: discord.Interaction):
         self.ping_mode = self._ping_select.values[0]
-
-        # Reset DM state on ping mode change
         self.dm_enabled = False
         self.dm_everyone_armed = False
 
-        # Role must be re-selected each time (clears when leaving role mode)
         if self.ping_mode != "role":
             self.role = None
 
@@ -548,27 +545,24 @@ class NotifyView(discord.ui.View):
 
     async def _on_role(self, interaction: discord.Interaction):
         self.role = self._role_select.values[0] if self._role_select.values else None
-
-        # If role cleared, DM becomes invalid -> OFF
         if self.ping_mode == "role" and not self.role:
             self.dm_enabled = False
-
         await self._rerender(interaction)
 
     async def _toggle_dm(self, interaction: discord.Interaction):
         if not self._dm_allowed():
-            return await interaction.response.send_message("DM is only available for @everyone or Role ping.", ephemeral=True)
+            return await interaction.response.send_message(
+                "DM is only available for @everyone or Role ping.", ephemeral=True
+            )
 
         if not self._dm_audience_ok():
             return await interaction.response.send_message("Pick a role first (Role ping).", ephemeral=True)
 
-        # OFF is immediate
         if self.dm_enabled:
             self.dm_enabled = False
             self.dm_everyone_armed = False
             return await self._rerender(interaction)
 
-        # ON: @everyone needs confirm
         if self.ping_mode == "everyone":
             modal = EveryoneConfirmModal()
             await interaction.response.send_modal(modal)
@@ -582,7 +576,6 @@ class NotifyView(discord.ui.View):
                 "✅ DM @everyone ARMED. Posting will require confirmation again.",
                 ephemeral=True,
             )
-            # Update the preview message
             try:
                 self._apply_role_select_state()
                 self._refresh_dm_button()
@@ -591,7 +584,6 @@ class NotifyView(discord.ui.View):
                 pass
             return
 
-        # Role: no extra confirm
         self.dm_enabled = True
         await self._rerender(interaction)
 
@@ -614,7 +606,7 @@ class NotifyView(discord.ui.View):
                 sent += 1
             except Exception:
                 failed += 1
-            await asyncio.sleep(0.6)  # gentle throttle
+            await asyncio.sleep(0.6)
         return sent, failed
 
     @discord.ui.button(label="Edit", style=discord.ButtonStyle.blurple)
@@ -647,15 +639,15 @@ class NotifyView(discord.ui.View):
         if not interaction.guild:
             return await interaction.response.send_message("Guild only.", ephemeral=True)
 
-        # If DM @everyone is enabled, require second confirmation modal
         if self.dm_enabled and self.ping_mode == "everyone":
             modal = EveryoneConfirmModal()
             await interaction.response.send_modal(modal)
             await modal.wait()
             if not modal.ok:
-                return await interaction.followup.send("❌ Post cancelled (DM @everyone not confirmed).", ephemeral=True)
+                return await interaction.followup.send(
+                    "❌ Post cancelled (DM @everyone not confirmed).", ephemeral=True
+                )
 
-        # Use defer so we can safely followup
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
@@ -664,7 +656,6 @@ class NotifyView(discord.ui.View):
         content = self.render()
 
         try:
-            # Post to announcements channel
             await self.channel.send(content, allowed_mentions=discord.AllowedMentions.all())
 
             dm_report = ""
