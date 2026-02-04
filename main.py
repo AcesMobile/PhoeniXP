@@ -367,14 +367,7 @@ async def silent_startup_audit():
         await sync_all_roles(guild)
 
 # -------------------------
-# NOTIFY (Prime-only, private preview -> posts to selected channel, optional DM)
-# DM rules:
-# - DM option exists ONLY for @everyone and Role ping
-# - Role must be selected each time (switching away from role clears it)
-# - @everyone DM requires confirm when enabling AND confirm again when posting
-# Channel rules:
-# - Channel select always available (text channels)
-# - Defaults to 📢announcements if it exists, otherwise current channel
+# NOTIFY
 # -------------------------
 def _ping_label(mode: str) -> str:
     return {"here": "@here", "everyone": "@everyone", "role": "Role"}.get(mode, "No ping")
@@ -429,7 +422,7 @@ class NotifyView(discord.ui.View):
     def __init__(self, author_id: int, channel: discord.TextChannel, title: str, body: str, note: str = ""):
         super().__init__(timeout=900)
         self.author_id = author_id
-        self.channel = channel  # post destination
+        self.channel = channel
 
         self.title = title
         self.body = body
@@ -441,7 +434,9 @@ class NotifyView(discord.ui.View):
         self.dm_enabled = False
         self.dm_everyone_armed = False
 
-        # Channel select (text + announcement/news channels)
+        # NEW: store the preview message so Edit can reliably re-render
+        self.preview_message: discord.Message | None = None
+
         self._channel_select = discord.ui.ChannelSelect(
             placeholder="Post channel",
             min_values=1,
@@ -548,23 +543,18 @@ class NotifyView(discord.ui.View):
         )
 
     async def _on_channel(self, interaction: discord.Interaction):
-        # IMPORTANT: ChannelSelect values are often "partial" objects.
-        # Resolve by ID against the guild cache (and optionally fetch) so self.channel actually updates.
         picked = self._channel_select.values[0]
         guild = interaction.guild
         if not guild:
             return await self._rerender(interaction)
 
         resolved = guild.get_channel(picked.id)
-
         if resolved is None:
-            # Try fetching if not in cache
             try:
                 resolved = await guild.fetch_channel(picked.id)
             except Exception:
                 resolved = None
 
-        # Accept anything that can send messages (TextChannel / NewsChannel)
         if resolved is not None and hasattr(resolved, "send"):
             self.channel = resolved
 
@@ -614,9 +604,8 @@ class NotifyView(discord.ui.View):
                 ephemeral=True,
             )
             try:
-                self._apply_role_select_state()
-                self._refresh_dm_button()
-                await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+                if self.preview_message:
+                    await self.preview_message.edit(content=self._preview_header() + self.render(), view=self)
             except Exception:
                 pass
             return
@@ -659,15 +648,19 @@ class NotifyView(discord.ui.View):
         self.body = modal.body_value
         self.note = modal.note_value
 
+        # IMPORTANT: actually update the preview message
         try:
-            await interaction.followup.send("✅ Updated preview.", ephemeral=True)
+            if self.preview_message:
+                await self.preview_message.edit(content=self._preview_header() + self.render(), view=self)
         except Exception:
-            pass
+            # fallback attempt
+            try:
+                await interaction.edit_original_response(content=self._preview_header() + self.render(), view=self)
+            except Exception:
+                pass
 
         try:
-            self._apply_role_select_state()
-            self._refresh_dm_button()
-            await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+            await interaction.followup.send("✅ Updated preview.", ephemeral=True)
         except Exception:
             pass
 
@@ -685,7 +678,6 @@ class NotifyView(discord.ui.View):
                     "❌ Post cancelled (DM @everyone not confirmed).", ephemeral=True
                 )
 
-        # Make sure we can send there
         me = interaction.guild.me
         if me and hasattr(self.channel, "permissions_for"):
             perms = self.channel.permissions_for(me)
@@ -715,7 +707,10 @@ class NotifyView(discord.ui.View):
             )
 
             try:
-                await interaction.message.edit(content="✅ Done.", view=None)
+                if self.preview_message:
+                    await self.preview_message.edit(content="✅ Done.", view=None)
+                else:
+                    await interaction.message.edit(content="✅ Done.", view=None)  # best effort
             except Exception:
                 pass
 
@@ -724,7 +719,13 @@ class NotifyView(discord.ui.View):
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
     async def cancel(self, interaction: discord.Interaction, _):
-        await interaction.response.edit_message(content="Cancelled.", view=None)
+        try:
+            if self.preview_message:
+                await self.preview_message.edit(content="Cancelled.", view=None)
+            else:
+                await interaction.response.edit_message(content="Cancelled.", view=None)
+        except Exception:
+            pass
 
 @bot.tree.command(name="notify")
 async def notify(interaction: discord.Interaction):
@@ -733,12 +734,10 @@ async def notify(interaction: discord.Interaction):
     if not is_admin(interaction):
         return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
 
-    # Default: 📢announcements if exists, else the channel the command was used in (if text)
     default_channel = get_announce_channel(interaction.guild)
     if default_channel is None and isinstance(interaction.channel, discord.TextChannel):
         default_channel = interaction.channel
     if default_channel is None:
-        # last-resort: first text channel
         default_channel = interaction.guild.text_channels[0] if interaction.guild.text_channels else None
     if default_channel is None:
         return await interaction.response.send_message("No text channels found.", ephemeral=True)
@@ -751,11 +750,14 @@ async def notify(interaction: discord.Interaction):
         return
 
     view = NotifyView(interaction.user.id, default_channel, modal.title_value, modal.body_value, modal.note_value)
-    await interaction.followup.send(
+
+    # IMPORTANT: capture the message we send so Edit can reliably update it
+    msg = await interaction.followup.send(
         view._preview_header() + view.render(),
         view=view,
         ephemeral=True,
     )
+    view.preview_message = msg
 
 # -------------------------
 # EVENTS
