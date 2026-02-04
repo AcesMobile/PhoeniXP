@@ -368,6 +368,13 @@ async def silent_startup_audit():
 
 # -------------------------
 # NOTIFY (Prime-only, private preview -> posts to selected channel, optional DM)
+# DM rules:
+# - DM option exists ONLY for @everyone and Role ping
+# - Role must be selected each time (switching away from role clears it)
+# - @everyone DM requires confirm when enabling AND confirm again when posting
+# Channel rules:
+# - Channel select always available (text channels)
+# - Defaults to 📢announcements if it exists, otherwise current channel
 # -------------------------
 def _ping_label(mode: str) -> str:
     return {"here": "@here", "everyone": "@everyone", "role": "Role"}.get(mode, "No ping")
@@ -434,7 +441,7 @@ class NotifyView(discord.ui.View):
         self.dm_enabled = False
         self.dm_everyone_armed = False
 
-        # Channel select (text + announcement channels)
+        # Channel select (text + announcement/news channels)
         self._channel_select = discord.ui.ChannelSelect(
             placeholder="Post channel",
             min_values=1,
@@ -541,12 +548,25 @@ class NotifyView(discord.ui.View):
         )
 
     async def _on_channel(self, interaction: discord.Interaction):
-        ch = self._channel_select.values[0]
+        # IMPORTANT: ChannelSelect values are often "partial" objects.
+        # Resolve by ID against the guild cache (and optionally fetch) so self.channel actually updates.
+        picked = self._channel_select.values[0]
+        guild = interaction.guild
+        if not guild:
+            return await self._rerender(interaction)
 
-        # ChannelSelect can return TextChannel or AnnouncementChannel (news).
-        # If it can .send(), it's a valid post destination.
-        if hasattr(ch, "send"):
-            self.channel = ch  # type: ignore
+        resolved = guild.get_channel(picked.id)
+
+        if resolved is None:
+            # Try fetching if not in cache
+            try:
+                resolved = await guild.fetch_channel(picked.id)
+            except Exception:
+                resolved = None
+
+        # Accept anything that can send messages (TextChannel / NewsChannel)
+        if resolved is not None and hasattr(resolved, "send"):
+            self.channel = resolved
 
         await self._rerender(interaction)
 
@@ -667,12 +687,11 @@ class NotifyView(discord.ui.View):
 
         # Make sure we can send there
         me = interaction.guild.me
-        if me:
+        if me and hasattr(self.channel, "permissions_for"):
             perms = self.channel.permissions_for(me)
-            if not perms.view_channel or not perms.send_messages:
+            if not perms.send_messages:
                 return await interaction.response.send_message(
-                    f"❌ I can't post in {self.channel.mention} (missing View Channel / Send Messages).",
-                    ephemeral=True,
+                    f"❌ I can't post in {self.channel.mention} (missing Send Messages).", ephemeral=True
                 )
 
         try:
