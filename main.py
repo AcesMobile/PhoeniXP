@@ -434,7 +434,6 @@ class NotifyView(discord.ui.View):
         self.dm_enabled = False
         self.dm_everyone_armed = False
 
-        # NEW: store the preview message so Edit can reliably re-render
         self.preview_message: discord.Message | None = None
 
         self._channel_select = discord.ui.ChannelSelect(
@@ -474,6 +473,22 @@ class NotifyView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.author_id
+
+    async def _close_preview(self):
+        """Remove the preview UI after Post/Cancel."""
+        try:
+            if self.preview_message:
+                await self.preview_message.delete()
+                return
+        except Exception:
+            pass
+
+        # fallback: strip the view so it can't be used anymore
+        try:
+            if self.preview_message:
+                await self.preview_message.edit(view=None)
+        except Exception:
+            pass
 
     def _apply_role_select_state(self):
         self._role_select.disabled = (self.ping_mode != "role")
@@ -648,16 +663,11 @@ class NotifyView(discord.ui.View):
         self.body = modal.body_value
         self.note = modal.note_value
 
-        # IMPORTANT: actually update the preview message
         try:
             if self.preview_message:
                 await self.preview_message.edit(content=self._preview_header() + self.render(), view=self)
         except Exception:
-            # fallback attempt
-            try:
-                await interaction.edit_original_response(content=self._preview_header() + self.render(), view=self)
-            except Exception:
-                pass
+            pass
 
         try:
             await interaction.followup.send("✅ Updated preview.", ephemeral=True)
@@ -706,13 +716,8 @@ class NotifyView(discord.ui.View):
                 ephemeral=True,
             )
 
-            try:
-                if self.preview_message:
-                    await self.preview_message.edit(content="✅ Done.", view=None)
-                else:
-                    await interaction.message.edit(content="✅ Done.", view=None)  # best effort
-            except Exception:
-                pass
+            # remove the preview modal/view
+            await self._close_preview()
 
         except Exception as e:
             await interaction.followup.send(f"❌ Failed: `{e}`", ephemeral=True)
@@ -720,10 +725,15 @@ class NotifyView(discord.ui.View):
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
     async def cancel(self, interaction: discord.Interaction, _):
         try:
-            if self.preview_message:
-                await self.preview_message.edit(content="Cancelled.", view=None)
-            else:
-                await interaction.response.edit_message(content="Cancelled.", view=None)
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+
+        # kill the preview message/view
+        await self._close_preview()
+
+        try:
+            await interaction.followup.send("Cancelled.", ephemeral=True)
         except Exception:
             pass
 
@@ -751,7 +761,6 @@ async def notify(interaction: discord.Interaction):
 
     view = NotifyView(interaction.user.id, default_channel, modal.title_value, modal.body_value, modal.note_value)
 
-    # IMPORTANT: capture the message we send so Edit can reliably update it
     msg = await interaction.followup.send(
         view._preview_header() + view.render(),
         view=view,
