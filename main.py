@@ -110,17 +110,15 @@ def auto_bold_phrases(text: str) -> str:
 
         def repl(m: re.Match) -> str:
             start, end = m.span(1)
-
-            # Skip if already bolded as **<match>**
             if start >= 2 and end + 2 <= len(text):
                 if text[start - 2:start] == "**" and text[end:end + 2] == "**":
                     return m.group(1)
-
             return f"**{m.group(1)}**"
 
         text = pattern.sub(repl, text)
 
     return text
+
 
 # -------------------------
 # DISCORD
@@ -131,11 +129,13 @@ intents.members = True
 intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+
 # -------------------------
 # GLOBAL LOCKS (fixes "database is locked")
 # -------------------------
 DB_LOCK = asyncio.Lock()
 _role_sync_tasks: dict[int, asyncio.Task] = {}
+
 
 # -------------------------
 # DB HELPERS
@@ -213,6 +213,7 @@ async def fetch_members(guild: discord.Guild) -> dict[int, discord.Member]:
 def get_announce_channel(guild: discord.Guild):
     return discord.utils.get(guild.text_channels, name=ANNOUNCE_CHANNEL_NAME)
 
+
 # -------------------------
 # XP CORE
 # -------------------------
@@ -234,6 +235,7 @@ def award_xp(c, gid: int, uid: int, amount: int, ts: int) -> int:
         WHERE guild_id=? AND user_id=?
     """, (clamp_xp(int(u["xp"]) + award), ts, bucket, earned + award, gid, uid))
     return award
+
 
 # -------------------------
 # RANKING (TOP-X)
@@ -266,6 +268,7 @@ def compute_rank_map(gid: int, member_ids: list[int]) -> dict[int, str]:
 
 def display_rank(m: discord.Member, computed: str) -> str:
     return f"{MANUAL_PRIME_ROLE} + {computed}" if has_prime(m) else computed
+
 
 # -------------------------
 # ROLE SYNC (DEBOUNCED)
@@ -307,6 +310,7 @@ async def sync_all_roles(guild: discord.Guild):
         except Exception:
             failed += 1
     return ok, failed
+
 
 # -------------------------
 # STARTUP AUDIT (SLOW + THROTTLED)
@@ -365,6 +369,7 @@ async def silent_startup_audit():
                 c.commit()
 
         await sync_all_roles(guild)
+
 
 # -------------------------
 # NOTIFY
@@ -434,7 +439,9 @@ class NotifyView(discord.ui.View):
         self.dm_enabled = False
         self.dm_everyone_armed = False
 
+        # track preview + the single "updated preview" toast
         self.preview_message: discord.Message | None = None
+        self._updated_toast: discord.Message | None = None
 
         self._channel_select = discord.ui.ChannelSelect(
             placeholder="Post channel",
@@ -474,21 +481,30 @@ class NotifyView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.author_id
 
-    async def _close_preview(self):
-        """Remove the preview UI after Post/Cancel."""
-        try:
-            if self.preview_message:
-                await self.preview_message.delete()
-                return
-        except Exception:
-            pass
+    async def _clear_updated_toast(self):
+        if self._updated_toast:
+            try:
+                await self._updated_toast.delete()
+            except Exception:
+                pass
+            self._updated_toast = None
 
-        # fallback: strip the view so it can't be used anymore
+    async def _toast_updated_once(self, interaction: discord.Interaction):
+        # ensure at most one exists: delete old then send new
+        await self._clear_updated_toast()
+        try:
+            self._updated_toast = await interaction.followup.send("✅ Updated preview.", ephemeral=True)
+        except Exception:
+            self._updated_toast = None
+
+    async def _close_preview_ui(self):
+        # clear the view so the "modal" goes away
         try:
             if self.preview_message:
-                await self.preview_message.edit(view=None)
+                await self.preview_message.edit(content=" ", view=None)
         except Exception:
             pass
+        await self._clear_updated_toast()
 
     def _apply_role_select_state(self):
         self._role_select.disabled = (self.ping_mode != "role")
@@ -663,16 +679,15 @@ class NotifyView(discord.ui.View):
         self.body = modal.body_value
         self.note = modal.note_value
 
+        # update the preview content (this is the real preview)
         try:
             if self.preview_message:
                 await self.preview_message.edit(content=self._preview_header() + self.render(), view=self)
         except Exception:
             pass
 
-        try:
-            await interaction.followup.send("✅ Updated preview.", ephemeral=True)
-        except Exception:
-            pass
+        # show the "updated preview" toast, but only one at a time
+        await self._toast_updated_once(interaction)
 
     @discord.ui.button(label="Post", style=discord.ButtonStyle.green)
     async def post(self, interaction: discord.Interaction, _):
@@ -716,8 +731,7 @@ class NotifyView(discord.ui.View):
                 ephemeral=True,
             )
 
-            # remove the preview modal/view
-            await self._close_preview()
+            await self._close_preview_ui()
 
         except Exception as e:
             await interaction.followup.send(f"❌ Failed: `{e}`", ephemeral=True)
@@ -729,8 +743,7 @@ class NotifyView(discord.ui.View):
         except Exception:
             pass
 
-        # kill the preview message/view
-        await self._close_preview()
+        await self._close_preview_ui()
 
         try:
             await interaction.followup.send("Cancelled.", ephemeral=True)
@@ -767,6 +780,7 @@ async def notify(interaction: discord.Interaction):
         ephemeral=True,
     )
     view.preview_message = msg
+
 
 # -------------------------
 # EVENTS
@@ -808,6 +822,7 @@ async def on_message(msg: discord.Message):
     if gained:
         await request_role_sync(msg.guild)
 
+
 # -------------------------
 # VC XP (1 XP per 5 minutes)
 # -------------------------
@@ -846,6 +861,7 @@ async def vc_xp_loop():
         if any_gain:
             await request_role_sync(guild)
 
+
 # -------------------------
 # DECAY
 # -------------------------
@@ -883,6 +899,7 @@ async def decay_loop():
 
         if changed:
             await request_role_sync(guild)
+
 
 # -------------------------
 # COMMANDS
