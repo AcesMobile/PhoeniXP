@@ -366,11 +366,14 @@ async def silent_startup_audit():
         await sync_all_roles(guild)
 
 # -------------------------
-# NOTIFY (Prime-only, private preview -> posts to 📢announcements, optional DM)
+# NOTIFY (Prime-only, private preview -> posts to selected channel, optional DM)
 # DM rules:
 # - DM option exists ONLY for @everyone and Role ping
 # - Role must be selected each time (switching away from role clears it)
 # - @everyone DM requires confirm when enabling AND confirm again when posting
+# Channel rules:
+# - Channel select always available (text channels)
+# - Defaults to 📢announcements if it exists, otherwise current channel
 # -------------------------
 def _ping_label(mode: str) -> str:
     return {"here": "@here", "everyone": "@everyone", "role": "Role"}.get(mode, "No ping")
@@ -425,7 +428,7 @@ class NotifyView(discord.ui.View):
     def __init__(self, author_id: int, channel: discord.TextChannel, title: str, body: str, note: str = ""):
         super().__init__(timeout=900)
         self.author_id = author_id
-        self.channel = channel
+        self.channel = channel  # post destination
 
         self.title = title
         self.body = body
@@ -436,6 +439,16 @@ class NotifyView(discord.ui.View):
 
         self.dm_enabled = False
         self.dm_everyone_armed = False
+
+        # Channel select (text channels only)
+        self._channel_select = discord.ui.ChannelSelect(
+            placeholder="Post channel",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+        )
+        self._channel_select.callback = self._on_channel
+        self.add_item(self._channel_select)
 
         self._ping_select = discord.ui.Select(
             placeholder="Ping mode",
@@ -500,7 +513,7 @@ class NotifyView(discord.ui.View):
 
     def _preview_header(self) -> str:
         ping = _ping_label(self.ping_mode)
-        extra = f"\nPing: **{ping}**"
+        extra = f"\nChannel: {self.channel.mention} | Ping: **{ping}**"
         if self.ping_mode == "role" and self.role:
             extra += f" (**{self.role.name}**)"
         if self._dm_allowed():
@@ -532,6 +545,12 @@ class NotifyView(discord.ui.View):
             content=self._preview_header() + self.render(),
             view=self,
         )
+
+    async def _on_channel(self, interaction: discord.Interaction):
+        ch = self._channel_select.values[0]
+        if isinstance(ch, discord.TextChannel):
+            self.channel = ch
+        await self._rerender(interaction)
 
     async def _on_ping_mode(self, interaction: discord.Interaction):
         self.ping_mode = self._ping_select.values[0]
@@ -648,6 +667,15 @@ class NotifyView(discord.ui.View):
                     "❌ Post cancelled (DM @everyone not confirmed).", ephemeral=True
                 )
 
+        # Make sure we can send there
+        me = interaction.guild.me
+        if me:
+            perms = self.channel.permissions_for(me)
+            if not perms.send_messages:
+                return await interaction.response.send_message(
+                    f"❌ I can't post in {self.channel.mention} (missing Send Messages).", ephemeral=True
+                )
+
         try:
             await interaction.response.defer(ephemeral=True)
         except Exception:
@@ -687,12 +715,15 @@ async def notify(interaction: discord.Interaction):
     if not is_admin(interaction):
         return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
 
-    ch = get_announce_channel(interaction.guild)
-    if not ch:
-        return await interaction.response.send_message(
-            f"Can't find channel named `{ANNOUNCE_CHANNEL_NAME}`.",
-            ephemeral=True,
-        )
+    # Default: 📢announcements if exists, else the channel the command was used in (if text)
+    default_channel = get_announce_channel(interaction.guild)
+    if default_channel is None and isinstance(interaction.channel, discord.TextChannel):
+        default_channel = interaction.channel
+    if default_channel is None:
+        # last-resort: first text channel
+        default_channel = interaction.guild.text_channels[0] if interaction.guild.text_channels else None
+    if default_channel is None:
+        return await interaction.response.send_message("No text channels found.", ephemeral=True)
 
     modal = NotifyModal()
     await interaction.response.send_modal(modal)
@@ -701,7 +732,7 @@ async def notify(interaction: discord.Interaction):
     if not modal.title_value or not modal.body_value:
         return
 
-    view = NotifyView(interaction.user.id, ch, modal.title_value, modal.body_value, modal.note_value)
+    view = NotifyView(interaction.user.id, default_channel, modal.title_value, modal.body_value, modal.note_value)
     await interaction.followup.send(
         view._preview_header() + view.render(),
         view=view,
