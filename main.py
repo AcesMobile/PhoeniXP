@@ -37,7 +37,9 @@ ROLE_NAMES = [ROLE_INITIATE, ROLE_OPERATIVE, ROLE_EMBER, ROLE_ASCENDANT]
 
 MANUAL_PRIME_ROLE = "Phoenix Prime"  # primes are admins
 
-DB_PATH = "xp.db"
+# ✅ Persist DB on Railway volume (mount volume to /app/data)
+DB_PATH = os.getenv("XP_DB_PATH", "/app/data/xp.db")
+
 ROLE_SYNC_DEBOUNCE_SECONDS = 20
 
 STARTUP_AUDIT_DAYS = 365
@@ -193,7 +195,15 @@ def clamp_xp(x: int) -> int:
     return max(0, min(MAX_XP, int(x)))
 
 
+def _ensure_db_dir():
+    try:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    except Exception:
+        pass
+
+
 def db():
+    _ensure_db_dir()
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL;")
@@ -810,7 +820,7 @@ class NotifyView(discord.ui.View):
             self.dm_everyone_armed = True
             self.dm_enabled = True
 
-            # FIX: update ephemeral preview reliably
+            # ✅ update ephemeral preview reliably
             await self._edit_preview(interaction, self._preview_header() + self.render_preview(), self)
             return
 
@@ -942,7 +952,7 @@ class NotifyView(discord.ui.View):
         self.body = modal.body_value
         self.note = modal.note_value
 
-        # FIX: use edit_original_response (ephemeral-safe)
+        # ✅ ephemeral-safe update
         self._refresh_dynamic_controls()
         self._refresh_image_controls()
         self._refresh_add_pictures_label()
@@ -1033,6 +1043,7 @@ class NotifyView(discord.ui.View):
         content = self.render_public()
         embeds, files = self._build_embeds_and_files()
 
+        # permission check
         problem = _can_post(interaction.guild, self.channel, content, bool(files), bool(embeds))
         if problem:
             try:
@@ -1055,6 +1066,7 @@ class NotifyView(discord.ui.View):
                     allowed_mentions=discord.AllowedMentions.all(),
                 )  # type: ignore
 
+            # ✅ update the ephemeral UI after success
             ch = getattr(self.channel, "mention", "the selected channel")
             try:
                 await interaction.edit_original_response(content=f"✅ Posted in {ch}.", view=None)
@@ -1132,7 +1144,9 @@ async def on_ready():
     if not vc_xp_loop.is_running():
         vc_xp_loop.start()
 
-    bot.loop.create_task(silent_startup_audit())
+    # ❌ Disabled: startup audit can "recreate" XP from only recent history on fresh DB
+    # bot.loop.create_task(silent_startup_audit())
+
     print("Ready:", bot.user)
 
 
