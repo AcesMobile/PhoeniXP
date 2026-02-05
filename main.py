@@ -1,5 +1,4 @@
 import os, time, sqlite3, io, asyncio, re
-
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -152,7 +151,6 @@ def _dedupe_filename(existing: set[str], desired: str) -> str:
         if cand not in existing:
             existing.add(cand)
             return cand
-    # last resort
     cand = f"{base}_{int(time.time())}.{ext}"
     existing.add(cand)
     return cand
@@ -531,6 +529,8 @@ class NotifyView(discord.ui.View):
 
         self._apply_role_select_state()
         self._refresh_dm_button()
+        self._refresh_image_controls()
+        self._refresh_add_pictures_label()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.author_id
@@ -557,15 +557,25 @@ class NotifyView(discord.ui.View):
             return self.role is not None
         return False
 
-    def _images_line(self) -> str:
-        if not self.images:
-            return "🖼️ Images: *(none)*"
-        names = [fn for _, fn in self.images]
-        shown = ", ".join(f"**{n}**" for n in names[:5])
-        more = f" +{len(names)-5} more" if len(names) > 5 else ""
-        return f"🖼️ Images: **{len(names)}** — {shown}{more}"
+    # --- UI refresh helpers ---
+    def _refresh_image_controls(self):
+        # Only show image management buttons if we actually have images
+        has_imgs = bool(self.images)
+        for item in (self.remove_last_picture, self.clear_pictures):
+            in_view = item in self.children
+            if has_imgs and not in_view:
+                self.add_item(item)
+            if (not has_imgs) and in_view:
+                self.remove_item(item)
 
-    def render(self) -> str:
+    def _refresh_add_pictures_label(self):
+        if self.images:
+            self.add_pictures.label = "Add More Picture(s)"
+        else:
+            self.add_pictures.label = "Add Picture(s)"
+
+    # --- message rendering ---
+    def render_public(self) -> str:
         ping = self._ping_text()
         title = auto_bold_phrases(self.title)
         body = auto_bold_phrases(self.body)
@@ -574,7 +584,12 @@ class NotifyView(discord.ui.View):
         msg = f"{(ping + chr(10)) if ping else ''}# {title}\n{body}"
         if note:
             msg += f"\n-# {note}"
-        msg += f"\n\n{self._images_line()}"
+        return msg
+
+    def render_preview(self) -> str:
+        msg = self.render_public()
+        if self.images:
+            msg += f"\n\n🖼️ Images: **{len(self.images)}**"
         return msg
 
     def _preview_header(self) -> str:
@@ -616,8 +631,10 @@ class NotifyView(discord.ui.View):
     async def _rerender(self, interaction: discord.Interaction):
         self._apply_role_select_state()
         self._refresh_dm_button()
+        self._refresh_image_controls()
+        self._refresh_add_pictures_label()
         await interaction.response.edit_message(
-            content=self._preview_header() + self.render(),
+            content=self._preview_header() + self.render_preview(),
             view=self,
         )
 
@@ -685,7 +702,7 @@ class NotifyView(discord.ui.View):
             self.dm_everyone_armed = True
             self.dm_enabled = True
             try:
-                await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+                await interaction.message.edit(content=self._preview_header() + self.render_preview(), view=self)
             except Exception:
                 pass
             return
@@ -820,7 +837,9 @@ class NotifyView(discord.ui.View):
         self.note = modal.note_value
 
         try:
-            await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+            self._refresh_image_controls()
+            self._refresh_add_pictures_label()
+            await interaction.message.edit(content=self._preview_header() + self.render_preview(), view=self)
         except Exception:
             pass
 
@@ -841,7 +860,7 @@ class NotifyView(discord.ui.View):
         if channel is None:
             self.waiting_for_image = False
             try:
-                await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+                await interaction.message.edit(content=self._preview_header() + self.render_preview(), view=self)
             except Exception:
                 pass
             return
@@ -851,7 +870,7 @@ class NotifyView(discord.ui.View):
             self.waiting_for_image = False
             try:
                 await interaction.message.edit(
-                    content=self._preview_header() + self.render() + "\n\n⏱️ *(Image upload timed out.)*",
+                    content=self._preview_header() + self.render_preview() + "\n\n⏱️ *(Image upload timed out.)*",
                     view=self,
                 )
             except Exception:
@@ -867,15 +886,12 @@ class NotifyView(discord.ui.View):
             pass
 
         self.waiting_for_image = False
-        tail = ""
-        if not ok:
-            tail = f"\n\n❌ *{note}*"
-        else:
-            # no extra message spam; just a small inline note once
-            tail = f"\n\n✅ *{note}*"
+        tail = f"\n\n✅ *{note}*" if ok else f"\n\n❌ *{note}*"
 
         try:
-            await interaction.message.edit(content=self._preview_header() + self.render() + tail, view=self)
+            self._refresh_image_controls()
+            self._refresh_add_pictures_label()
+            await interaction.message.edit(content=self._preview_header() + self.render_preview() + tail, view=self)
         except Exception:
             pass
 
@@ -915,7 +931,7 @@ class NotifyView(discord.ui.View):
             except Exception:
                 pass
 
-        content = self.render()
+        content = self.render_public()
         embeds, files = self._build_embeds_and_files()
 
         try:
@@ -980,7 +996,7 @@ async def notify(interaction: discord.Interaction):
 
     view = NotifyView(interaction.user.id, default_channel, modal.title_value, modal.body_value, modal.note_value)
     await interaction.followup.send(
-        view._preview_header() + view.render(),
+        view._preview_header() + view.render_preview(),
         view=view,
         ephemeral=True,
     )
