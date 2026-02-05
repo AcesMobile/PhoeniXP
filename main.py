@@ -494,14 +494,15 @@ class NotifyView(discord.ui.View):
 
         self.waiting_for_image = False
 
+        # ---- COMPONENTS (we will add/remove dynamically) ----
         self._channel_select = discord.ui.ChannelSelect(
             placeholder="Post channel",
             min_values=1,
             max_values=1,
             channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            row=0,
         )
         self._channel_select.callback = self._on_channel
-        self.add_item(self._channel_select)
 
         self._ping_select = discord.ui.Select(
             placeholder="Ping mode",
@@ -511,32 +512,39 @@ class NotifyView(discord.ui.View):
                 discord.SelectOption(label="@everyone", value="everyone"),
                 discord.SelectOption(label="Role ping", value="role"),
             ],
+            row=1,
         )
         self._ping_select.callback = self._on_ping_mode
-        self.add_item(self._ping_select)
 
         self._role_select = discord.ui.RoleSelect(
             placeholder="Role (only used if Role ping)",
             min_values=0,
             max_values=1,
+            row=2,
         )
         self._role_select.callback = self._on_role
-        self.add_item(self._role_select)
 
-        self._dm_button = discord.ui.Button(label="DM pinged users: OFF", style=discord.ButtonStyle.secondary)
+        self._dm_button = discord.ui.Button(
+            label="DM pinged users: OFF",
+            style=discord.ButtonStyle.secondary,
+            row=3,
+        )
         self._dm_button.callback = self._toggle_dm
-        self.add_item(self._dm_button)
 
-        self._apply_role_select_state()
+        # Always-visible controls
+        self.add_item(self._channel_select)
+        self.add_item(self._ping_select)
+
+        # Conditional controls (role select + DM button)
+        self._refresh_dynamic_controls()
         self._refresh_dm_button()
+
+        # Existing image UI rules
         self._refresh_image_controls()
         self._refresh_add_pictures_label()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.author_id
-
-    def _apply_role_select_state(self):
-        self._role_select.disabled = (self.ping_mode != "role")
 
     def _ping_text(self) -> str:
         if self.ping_mode == "here":
@@ -548,14 +556,36 @@ class NotifyView(discord.ui.View):
         return ""
 
     def _dm_allowed(self) -> bool:
+        # DM feature exists for everyone + role
         return self.ping_mode in ("everyone", "role")
 
     def _dm_audience_ok(self) -> bool:
+        # "usable right now"
         if self.ping_mode == "everyone":
             return True
         if self.ping_mode == "role":
             return self.role is not None
         return False
+
+    def _refresh_dynamic_controls(self):
+        # ROLE SELECT: only show when ping_mode == "role"
+        role_should_exist = (self.ping_mode == "role")
+        role_in_view = (self._role_select in self.children)
+        if role_should_exist and not role_in_view:
+            self.add_item(self._role_select)
+        elif (not role_should_exist) and role_in_view:
+            self.remove_item(self._role_select)
+
+        # DM BUTTON: only show when DM is usable (everyone OR role+selected)
+        dm_should_exist = self._dm_allowed() and self._dm_audience_ok()
+        dm_in_view = (self._dm_button in self.children)
+        if dm_should_exist and not dm_in_view:
+            self.add_item(self._dm_button)
+        elif (not dm_should_exist) and dm_in_view:
+            # if it disappears, disarm it
+            self.dm_enabled = False
+            self.dm_everyone_armed = False
+            self.remove_item(self._dm_button)
 
     # --- UI refresh helpers ---
     def _refresh_image_controls(self):
@@ -569,10 +599,7 @@ class NotifyView(discord.ui.View):
                 self.remove_item(item)
 
     def _refresh_add_pictures_label(self):
-        if self.images:
-            self.add_pictures.label = "Add More Picture(s)"
-        else:
-            self.add_pictures.label = "Add Picture(s)"
+        self.add_pictures.label = "Add More Picture(s)" if self.images else "Add Picture(s)"
 
     # --- message rendering ---
     def render_public(self) -> str:
@@ -611,16 +638,7 @@ class NotifyView(discord.ui.View):
         return "📝 **Preview (private)** — Edit / Pictures / Post / Cancel" + extra + "\n\n"
 
     def _refresh_dm_button(self):
-        if not self._dm_allowed():
-            self.dm_enabled = False
-            self.dm_everyone_armed = False
-            self._dm_button.disabled = True
-            self._dm_button.label = "DM pinged users: OFF"
-            self._dm_button.style = discord.ButtonStyle.secondary
-            return
-
-        self._dm_button.disabled = False
-
+        # Only call if button exists (or about to)
         if self.ping_mode == "everyone":
             self._dm_button.label = f"DM @everyone: {'ON' if self.dm_enabled else 'OFF'}"
             self._dm_button.style = discord.ButtonStyle.danger if self.dm_enabled else discord.ButtonStyle.secondary
@@ -629,8 +647,9 @@ class NotifyView(discord.ui.View):
             self._dm_button.style = discord.ButtonStyle.success if self.dm_enabled else discord.ButtonStyle.secondary
 
     async def _rerender(self, interaction: discord.Interaction):
-        self._apply_role_select_state()
-        self._refresh_dm_button()
+        self._refresh_dynamic_controls()
+        if self._dm_button in self.children:
+            self._refresh_dm_button()
         self._refresh_image_controls()
         self._refresh_add_pictures_label()
         await interaction.response.edit_message(
@@ -707,6 +726,7 @@ class NotifyView(discord.ui.View):
                 pass
             return
 
+        # role DM
         self.dm_enabled = True
         await self._rerender(interaction)
 
@@ -742,7 +762,6 @@ class NotifyView(discord.ui.View):
 
         for m in targets:
             try:
-                # rebuild files for each DM (files get consumed)
                 files: list[discord.File] = []
                 if self.images:
                     for data, filename in self.images[:NOTIFY_MAX_IMAGES]:
@@ -879,7 +898,6 @@ class NotifyView(discord.ui.View):
 
         ok, note = await self._append_images_from_message(msg)
 
-        # delete the user's upload message so nothing lingers
         try:
             await msg.delete()
         except Exception:
@@ -922,7 +940,6 @@ class NotifyView(discord.ui.View):
                     pass
                 return
 
-        # acknowledge click instantly (prevents "interaction failed")
         try:
             await interaction.response.edit_message(content="⏳ Posting…", view=None)
         except Exception:
