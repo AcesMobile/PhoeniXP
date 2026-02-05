@@ -51,6 +51,10 @@ NOTIFY_IMAGE_WAIT_SECONDS = 60
 NOTIFY_MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8MB safety cap
 NOTIFY_MAX_IMAGES = 10  # Discord single-message attachment limit
 
+# Throttles
+ROLE_SYNC_SLEEP_EVERY_EDITS = 8
+ROLE_SYNC_SLEEP_SECONDS = 1.0
+
 
 # -------------------------
 # /notify auto-bold list
@@ -97,20 +101,22 @@ AUTO_BOLD_PHRASES = [
     "Halies Port","Haka","Farsight Sector","Prasa","Pollux 31","Polaris Prime","Pherkad Secundus","Grand Errant",
 ]
 
+# Precompile bold patterns once (big CPU win)
+_COMPILED_BOLD_PATTERNS: list[re.Pattern] = []
+for _phrase in sorted(AUTO_BOLD_PHRASES, key=len, reverse=True):
+    if not _phrase:
+        continue
+    esc = re.escape(_phrase)
+    _COMPILED_BOLD_PATTERNS.append(
+        re.compile(rf"(?i)(?<![0-9A-Za-z_])({esc})(?![0-9A-Za-z_])")
+    )
+
 
 def auto_bold_phrases(text: str) -> str:
     if not text:
         return text
 
-    phrases = sorted(AUTO_BOLD_PHRASES, key=len, reverse=True)
-
-    for phrase in phrases:
-        if not phrase:
-            continue
-
-        escaped = re.escape(phrase)
-        pattern = re.compile(rf"(?i)(?<![0-9A-Za-z_])({escaped})(?![0-9A-Za-z_])")
-
+    for pattern in _COMPILED_BOLD_PATTERNS:
         def repl(m: re.Match) -> str:
             start, end = m.span(1)
             if start >= 2 and end + 2 <= len(text):
@@ -175,9 +181,16 @@ _role_sync_tasks: dict[int, asyncio.Task] = {}
 # -------------------------
 # DB HELPERS
 # -------------------------
-def now() -> int: return int(time.time())
-def minute_bucket(ts: int) -> int: return ts // 60
-def clamp_xp(x: int) -> int: return max(0, min(MAX_XP, int(x)))
+def now() -> int:
+    return int(time.time())
+
+
+def minute_bucket(ts: int) -> int:
+    return ts // 60
+
+
+def clamp_xp(x: int) -> int:
+    return max(0, min(MAX_XP, int(x)))
 
 
 def db():
@@ -210,28 +223,45 @@ def init_db():
             value TEXT
         )
         """)
+        # Indexes for hottest queries
+        c.execute("CREATE INDEX IF NOT EXISTS idx_users_guild_xp ON users(guild_id, xp DESC, user_id ASC)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_users_guild_last_active ON users(guild_id, last_active)")
         c.commit()
 
 
-def get_user(c, gid: int, uid: int):
+def ensure_users_exist(c: sqlite3.Connection, gid: int, member_ids: list[int]) -> None:
+    if not member_ids:
+        return
+    c.executemany(
+        "INSERT INTO users (guild_id, user_id) VALUES (?, ?) "
+        "ON CONFLICT(guild_id, user_id) DO NOTHING",
+        [(gid, uid) for uid in member_ids],
+    )
+
+
+def get_user(c: sqlite3.Connection, gid: int, uid: int):
     r = c.execute("SELECT * FROM users WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
     if r:
         return r
-    c.execute("INSERT INTO users (guild_id, user_id) VALUES (?,?)", (gid, uid))
+    c.execute(
+        "INSERT INTO users (guild_id, user_id) VALUES (?, ?) "
+        "ON CONFLICT(guild_id, user_id) DO NOTHING",
+        (gid, uid),
+    )
     c.commit()
     return c.execute("SELECT * FROM users WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
 
 
-def meta_get(c, key: str, default=None):
+def meta_get(c: sqlite3.Connection, key: str, default=None):
     r = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return r["value"] if r else default
 
 
-def meta_set(c, key: str, value):
+def meta_set(c: sqlite3.Connection, key: str, value):
     c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
 
 
-def reset_audit_state(c, gid: int):
+def reset_audit_state(c: sqlite3.Connection, gid: int):
     c.execute("""
         UPDATE users
         SET chat_cooldown=0, last_minute=0, earned_this_minute=0
@@ -248,7 +278,7 @@ def is_admin(i: discord.Interaction) -> bool:
 
 
 async def fetch_members(guild: discord.Guild) -> dict[int, discord.Member]:
-    out = {}
+    out: dict[int, discord.Member] = {}
     async for m in guild.fetch_members(limit=None):
         if not m.bot:
             out[m.id] = m
@@ -262,7 +292,7 @@ def get_announce_channel(guild: discord.Guild):
 # -------------------------
 # XP CORE
 # -------------------------
-def award_xp(c, gid: int, uid: int, amount: int, ts: int) -> int:
+def award_xp(c: sqlite3.Connection, gid: int, uid: int, amount: int, ts: int) -> int:
     u = get_user(c, gid, uid)
     bucket = minute_bucket(ts)
 
@@ -286,21 +316,28 @@ def award_xp(c, gid: int, uid: int, amount: int, ts: int) -> int:
 # RANKING (TOP-X)
 # -------------------------
 def compute_rank_map(gid: int, member_ids: list[int]) -> dict[int, str]:
-    with db() as c:
-        for uid in member_ids:
-            get_user(c, gid, uid)
-        rows = c.execute("SELECT user_id, xp FROM users WHERE guild_id=?", (gid,)).fetchall()
+    if not member_ids:
+        return {}
 
-    xp = {int(r["user_id"]): int(r["xp"]) for r in rows}
-    eligible = [(uid, xp.get(uid, 0)) for uid in member_ids if xp.get(uid, 0) >= INITIATE_EXIT_XP]
+    # Read only existing rows; missing members count as 0 XP.
+    with db() as c:
+        placeholders = ",".join("?" for _ in member_ids)
+        rows = c.execute(
+            f"SELECT user_id, xp FROM users WHERE guild_id=? AND user_id IN ({placeholders})",
+            (gid, *member_ids),
+        ).fetchall()
+
+    xp_map = {int(r["user_id"]): int(r["xp"]) for r in rows}
+
+    eligible = [(uid, xp_map.get(uid, 0)) for uid in member_ids if xp_map.get(uid, 0) >= INITIATE_EXIT_XP]
     eligible.sort(key=lambda x: (-x[1], x[0]))
 
     topA = {uid for uid, _ in eligible[:TOP_ASCENDANT]}
     nextE = {uid for uid, _ in eligible[TOP_ASCENDANT:TOP_ASCENDANT + NEXT_EMBER]}
 
-    out = {}
+    out: dict[int, str] = {}
     for uid in member_ids:
-        x = xp.get(uid, 0)
+        x = xp_map.get(uid, 0)
         if x < INITIATE_EXIT_XP:
             out[uid] = ROLE_INITIATE
         elif uid in topA:
@@ -334,28 +371,49 @@ async def request_role_sync(guild: discord.Guild):
 
 
 async def sync_all_roles(guild: discord.Guild):
-    roles = {r.name: r for r in guild.roles}
-    managed = [roles[n] for n in ROLE_NAMES if n in roles]
+    roles_by_name = {r.name: r for r in guild.roles}
+    managed = [roles_by_name[n] for n in ROLE_NAMES if n in roles_by_name]
 
     members = await fetch_members(guild)
     ids = list(members.keys())
+
+    # optional: ensure rows exist (single bulk upsert)
+    async with DB_LOCK:
+        with db() as c:
+            ensure_users_exist(c, guild.id, ids)
+            c.commit()
+
     rank_map = compute_rank_map(guild.id, ids)
 
     ok = failed = 0
+    edits = 0
+
     for uid, m in members.items():
-        target_role = roles.get(rank_map.get(uid, ROLE_INITIATE))
+        target_name = rank_map.get(uid, ROLE_INITIATE)
+        target_role = roles_by_name.get(target_name)
         if not target_role:
             failed += 1
             continue
+
+        current_managed = [r for r in managed if r in m.roles]
+        if len(current_managed) == 1 and current_managed[0].id == target_role.id:
+            continue
+
+        to_remove = [r for r in current_managed if r.id != target_role.id]
+
         try:
-            to_remove = [r for r in managed if r in m.roles and r != target_role]
             if to_remove:
                 await m.remove_roles(*to_remove, reason="Rank sync")
             if target_role not in m.roles:
                 await m.add_roles(target_role, reason="Rank sync")
             ok += 1
+            edits += 1
         except Exception:
             failed += 1
+
+        if edits and edits % ROLE_SYNC_SLEEP_EVERY_EDITS == 0:
+            await asyncio.sleep(ROLE_SYNC_SLEEP_SECONDS)
+
     return ok, failed
 
 
@@ -363,6 +421,7 @@ async def sync_all_roles(guild: discord.Guild):
 # STARTUP AUDIT (SLOW + THROTTLED)
 # -------------------------
 async def silent_startup_audit():
+    # Runs in background; do not block on_ready.
     for guild in bot.guilds:
         key = f"startup_audit_done:{guild.id}"
 
@@ -379,6 +438,14 @@ async def silent_startup_audit():
 
         async with DB_LOCK:
             with db() as c:
+                # make sure member rows exist, once
+                try:
+                    members = await fetch_members(guild)
+                    ensure_users_exist(c, guild.id, list(members.keys()))
+                    c.commit()
+                except Exception:
+                    pass
+
                 for ch in guild.text_channels:
                     me = guild.me
                     if not me:
@@ -556,11 +623,9 @@ class NotifyView(discord.ui.View):
         return ""
 
     def _dm_allowed(self) -> bool:
-        # DM feature exists for everyone + role
         return self.ping_mode in ("everyone", "role")
 
     def _dm_audience_ok(self) -> bool:
-        # "usable right now"
         if self.ping_mode == "everyone":
             return True
         if self.ping_mode == "role":
@@ -568,7 +633,6 @@ class NotifyView(discord.ui.View):
         return False
 
     def _refresh_dynamic_controls(self):
-        # ROLE SELECT: only show when ping_mode == "role"
         role_should_exist = (self.ping_mode == "role")
         role_in_view = (self._role_select in self.children)
         if role_should_exist and not role_in_view:
@@ -576,20 +640,16 @@ class NotifyView(discord.ui.View):
         elif (not role_should_exist) and role_in_view:
             self.remove_item(self._role_select)
 
-        # DM BUTTON: only show when DM is usable (everyone OR role+selected)
         dm_should_exist = self._dm_allowed() and self._dm_audience_ok()
         dm_in_view = (self._dm_button in self.children)
         if dm_should_exist and not dm_in_view:
             self.add_item(self._dm_button)
         elif (not dm_should_exist) and dm_in_view:
-            # if it disappears, disarm it
             self.dm_enabled = False
             self.dm_everyone_armed = False
             self.remove_item(self._dm_button)
 
-    # --- UI refresh helpers ---
     def _refresh_image_controls(self):
-        # Only show image management buttons if we actually have images
         has_imgs = bool(self.images)
         for item in (self.remove_last_picture, self.clear_pictures):
             in_view = item in self.children
@@ -601,7 +661,6 @@ class NotifyView(discord.ui.View):
     def _refresh_add_pictures_label(self):
         self.add_pictures.label = "Add More Picture(s)" if self.images else "Add Picture(s)"
 
-    # --- message rendering ---
     def render_public(self) -> str:
         ping = self._ping_text()
         title = auto_bold_phrases(self.title)
@@ -638,7 +697,6 @@ class NotifyView(discord.ui.View):
         return "📝 **Preview (private)** — Edit / Pictures / Post / Cancel" + extra + "\n\n"
 
     def _refresh_dm_button(self):
-        # Only call if button exists (or about to)
         if self.ping_mode == "everyone":
             self._dm_button.label = f"DM @everyone: {'ON' if self.dm_enabled else 'OFF'}"
             self._dm_button.style = discord.ButtonStyle.danger if self.dm_enabled else discord.ButtonStyle.secondary
@@ -726,7 +784,6 @@ class NotifyView(discord.ui.View):
                 pass
             return
 
-        # role DM
         self.dm_enabled = True
         await self._rerender(interaction)
 
@@ -1030,7 +1087,10 @@ async def on_ready():
         decay_loop.start()
     if not vc_xp_loop.is_running():
         vc_xp_loop.start()
-    await silent_startup_audit()
+
+    # IMPORTANT: don't block startup on long audit
+    bot.loop.create_task(silent_startup_audit())
+
     print("Ready:", bot.user)
 
 
@@ -1043,7 +1103,9 @@ async def on_message(msg: discord.Message):
     if len((msg.content or "").strip()) < MIN_MESSAGE_CHARS:
         return
 
-    ts = now()
+    ts = int(msg.created_at.timestamp())  # consistent bucket timing
+
+    gained = 0
     async with DB_LOCK:
         with db() as c:
             u = get_user(c, msg.guild.id, msg.author.id)
@@ -1051,10 +1113,14 @@ async def on_message(msg: discord.Message):
                 return
 
             gained = award_xp(c, msg.guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
-            c.execute(
-                "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
-                (ts + CHAT_COOLDOWN_SECONDS, msg.guild.id, msg.author.id),
-            )
+
+            # Only set cooldown if XP actually awarded (prevents "stealing" awards at cap)
+            if gained:
+                c.execute(
+                    "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
+                    (ts + CHAT_COOLDOWN_SECONDS, msg.guild.id, msg.author.id),
+                )
+
             c.commit()
 
     if gained:
@@ -1156,8 +1222,8 @@ async def standing(interaction: discord.Interaction):
 
     async with DB_LOCK:
         with db() as c:
-            for uid in ids:
-                get_user(c, guild.id, uid)
+            ensure_users_exist(c, guild.id, ids)
+            c.commit()
             rows = c.execute("""
                 SELECT user_id, xp FROM users
                 WHERE guild_id=?
@@ -1197,8 +1263,8 @@ async def leaderboard(interaction: discord.Interaction, announce: bool = False):
 
     async with DB_LOCK:
         with db() as c:
-            for uid in ids:
-                get_user(c, guild.id, uid)
+            ensure_users_exist(c, guild.id, ids)
+            c.commit()
             rows = c.execute("""
                 SELECT user_id, xp FROM users
                 WHERE guild_id=?
@@ -1310,6 +1376,7 @@ async def resetranks(interaction: discord.Interaction, member: discord.Member | 
     changed = 0
     async with DB_LOCK:
         with db() as c:
+            ensure_users_exist(c, guild.id, targets)
             for uid in targets:
                 u = get_user(c, guild.id, uid)
                 old = int(u["xp"])
