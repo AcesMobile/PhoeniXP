@@ -1,4 +1,4 @@
-import os, time, sqlite3, io, asyncio, re
+import os, time, sqlite3, io, asyncio, re, traceback
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -223,7 +223,6 @@ def init_db():
             value TEXT
         )
         """)
-        # Indexes for hottest queries
         c.execute("CREATE INDEX IF NOT EXISTS idx_users_guild_xp ON users(guild_id, xp DESC, user_id ASC)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_users_guild_last_active ON users(guild_id, last_active)")
         c.commit()
@@ -319,7 +318,6 @@ def compute_rank_map(gid: int, member_ids: list[int]) -> dict[int, str]:
     if not member_ids:
         return {}
 
-    # Read only existing rows; missing members count as 0 XP.
     with db() as c:
         placeholders = ",".join("?" for _ in member_ids)
         rows = c.execute(
@@ -377,7 +375,6 @@ async def sync_all_roles(guild: discord.Guild):
     members = await fetch_members(guild)
     ids = list(members.keys())
 
-    # optional: ensure rows exist (single bulk upsert)
     async with DB_LOCK:
         with db() as c:
             ensure_users_exist(c, guild.id, ids)
@@ -421,7 +418,6 @@ async def sync_all_roles(guild: discord.Guild):
 # STARTUP AUDIT (SLOW + THROTTLED)
 # -------------------------
 async def silent_startup_audit():
-    # Runs in background; do not block on_ready.
     for guild in bot.guilds:
         key = f"startup_audit_done:{guild.id}"
 
@@ -438,7 +434,6 @@ async def silent_startup_audit():
 
         async with DB_LOCK:
             with db() as c:
-                # make sure member rows exist, once
                 try:
                     members = await fetch_members(guild)
                     ensure_users_exist(c, guild.id, list(members.keys()))
@@ -486,10 +481,36 @@ async def silent_startup_audit():
 
 
 # -------------------------
-# NOTIFY
+# NOTIFY (helpers)
 # -------------------------
 def _ping_label(mode: str) -> str:
     return {"here": "@here", "everyone": "@everyone", "role": "Role"}.get(mode, "No ping")
+
+
+def _can_post(guild: discord.Guild, channel: discord.abc.Messageable, content: str, has_files: bool, has_embeds: bool) -> str | None:
+    """Return a human readable problem, or None if ok / cannot check."""
+    me = guild.me
+    if not me:
+        return "Bot member not resolved (guild.me is None)."
+
+    if not isinstance(channel, discord.abc.GuildChannel):
+        return None  # can't reliably check perms on non-guild channel-like objects
+
+    perms = channel.permissions_for(me)
+
+    if not perms.view_channel:
+        return "I can't view that channel."
+    if not perms.send_messages:
+        return "Missing **Send Messages** permission."
+    if has_files and not perms.attach_files:
+        return "Missing **Attach Files** permission."
+    if has_embeds and not perms.embed_links:
+        return "Missing **Embed Links** permission."
+
+    if ("@everyone" in content or "@here" in content) and not perms.mention_everyone:
+        return "Missing **Mention @everyone/@here** permission."
+
+    return None
 
 
 class NotifyModal(discord.ui.Modal, title="Build Announcement"):
@@ -556,12 +577,9 @@ class NotifyView(discord.ui.View):
         self.dm_enabled = False
         self.dm_everyone_armed = False
 
-        # multi-image: list of (bytes, filename)
         self.images: list[tuple[bytes, str]] = []
-
         self.waiting_for_image = False
 
-        # ---- COMPONENTS (we will add/remove dynamically) ----
         self._channel_select = discord.ui.ChannelSelect(
             placeholder="Post channel",
             min_values=1,
@@ -598,15 +616,11 @@ class NotifyView(discord.ui.View):
         )
         self._dm_button.callback = self._toggle_dm
 
-        # Always-visible controls
         self.add_item(self._channel_select)
         self.add_item(self._ping_select)
 
-        # Conditional controls (role select + DM button)
         self._refresh_dynamic_controls()
         self._refresh_dm_button()
-
-        # Existing image UI rules
         self._refresh_image_controls()
         self._refresh_add_pictures_label()
 
@@ -997,6 +1011,7 @@ class NotifyView(discord.ui.View):
                     pass
                 return
 
+        # show immediate UI feedback
         try:
             await interaction.response.edit_message(content="⏳ Posting…", view=None)
         except Exception:
@@ -1007,6 +1022,15 @@ class NotifyView(discord.ui.View):
 
         content = self.render_public()
         embeds, files = self._build_embeds_and_files()
+
+        # permission check (prevents “it posted but UI stuck” + surfaces perms)
+        problem = _can_post(interaction.guild, self.channel, content, bool(files), bool(embeds))
+        if problem:
+            try:
+                await interaction.edit_original_response(content=f"❌ Can't post: {problem}", view=None)
+            except Exception:
+                pass
+            return
 
         try:
             if files and embeds:
@@ -1022,6 +1046,13 @@ class NotifyView(discord.ui.View):
                     allowed_mentions=discord.AllowedMentions.all(),
                 )  # type: ignore
 
+            # ✅ THIS is the main fix: update the ephemeral UI after success
+            ch = getattr(self.channel, "mention", "the selected channel")
+            try:
+                await interaction.edit_original_response(content=f"✅ Posted in {ch}.", view=None)
+            except Exception:
+                pass
+
             if self.dm_enabled:
                 sent, failed = await self._send_dms(interaction.guild, content, embeds)
                 try:
@@ -1030,10 +1061,15 @@ class NotifyView(discord.ui.View):
                     pass
 
         except Exception as e:
+            traceback.print_exc()
+            msg = f"❌ Failed: `{type(e).__name__}: {e}`"
             try:
-                await interaction.followup.send(f"❌ Failed: `{e}`", ephemeral=True)
+                await interaction.followup.send(msg, ephemeral=True)
             except Exception:
-                pass
+                try:
+                    await interaction.edit_original_response(content=msg, view=None)
+                except Exception:
+                    pass
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, row=4)
     async def cancel(self, interaction: discord.Interaction, _):
@@ -1088,9 +1124,7 @@ async def on_ready():
     if not vc_xp_loop.is_running():
         vc_xp_loop.start()
 
-    # IMPORTANT: don't block startup on long audit
     bot.loop.create_task(silent_startup_audit())
-
     print("Ready:", bot.user)
 
 
@@ -1103,7 +1137,7 @@ async def on_message(msg: discord.Message):
     if len((msg.content or "").strip()) < MIN_MESSAGE_CHARS:
         return
 
-    ts = int(msg.created_at.timestamp())  # consistent bucket timing
+    ts = int(msg.created_at.timestamp())
 
     gained = 0
     async with DB_LOCK:
@@ -1114,7 +1148,6 @@ async def on_message(msg: discord.Message):
 
             gained = award_xp(c, msg.guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
 
-            # Only set cooldown if XP actually awarded (prevents "stealing" awards at cap)
             if gained:
                 c.execute(
                     "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
