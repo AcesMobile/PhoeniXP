@@ -627,6 +627,23 @@ class NotifyView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.author_id
 
+    async def _edit_preview(self, interaction: discord.Interaction, content: str, view: discord.ui.View | None):
+        """
+        Ephemeral messages frequently fail to update via interaction.message.edit().
+        Always try edit_original_response first, then fall back.
+        """
+        try:
+            await interaction.edit_original_response(content=content, view=view)
+            return
+        except Exception:
+            pass
+
+        try:
+            if interaction.message:
+                await interaction.message.edit(content=content, view=view)
+        except Exception:
+            pass
+
     def _ping_text(self) -> str:
         if self.ping_mode == "here":
             return "@here"
@@ -792,10 +809,9 @@ class NotifyView(discord.ui.View):
 
             self.dm_everyone_armed = True
             self.dm_enabled = True
-            try:
-                await interaction.message.edit(content=self._preview_header() + self.render_preview(), view=self)
-            except Exception:
-                pass
+
+            # FIX: update ephemeral preview reliably
+            await self._edit_preview(interaction, self._preview_header() + self.render_preview(), self)
             return
 
         self.dm_enabled = True
@@ -926,12 +942,14 @@ class NotifyView(discord.ui.View):
         self.body = modal.body_value
         self.note = modal.note_value
 
-        try:
-            self._refresh_image_controls()
-            self._refresh_add_pictures_label()
-            await interaction.message.edit(content=self._preview_header() + self.render_preview(), view=self)
-        except Exception:
-            pass
+        # FIX: use edit_original_response (ephemeral-safe)
+        self._refresh_dynamic_controls()
+        self._refresh_image_controls()
+        self._refresh_add_pictures_label()
+        if self._dm_button in self.children:
+            self._refresh_dm_button()
+
+        await self._edit_preview(interaction, self._preview_header() + self.render_preview(), self)
 
     @discord.ui.button(label="Add Picture(s)", style=discord.ButtonStyle.secondary, row=3)
     async def add_pictures(self, interaction: discord.Interaction, _):
@@ -949,22 +967,17 @@ class NotifyView(discord.ui.View):
         channel = interaction.channel
         if channel is None:
             self.waiting_for_image = False
-            try:
-                await interaction.message.edit(content=self._preview_header() + self.render_preview(), view=self)
-            except Exception:
-                pass
+            await self._edit_preview(interaction, self._preview_header() + self.render_preview(), self)
             return
 
         msg = await self._wait_for_image_message(channel, interaction.user.id)
         if msg is None:
             self.waiting_for_image = False
-            try:
-                await interaction.message.edit(
-                    content=self._preview_header() + self.render_preview() + "\n\n⏱️ *(Image upload timed out.)*",
-                    view=self,
-                )
-            except Exception:
-                pass
+            await self._edit_preview(
+                interaction,
+                self._preview_header() + self.render_preview() + "\n\n⏱️ *(Image upload timed out.)*",
+                self
+            )
             return
 
         ok, note = await self._append_images_from_message(msg)
@@ -977,12 +990,9 @@ class NotifyView(discord.ui.View):
         self.waiting_for_image = False
         tail = f"\n\n✅ *{note}*" if ok else f"\n\n❌ *{note}*"
 
-        try:
-            self._refresh_image_controls()
-            self._refresh_add_pictures_label()
-            await interaction.message.edit(content=self._preview_header() + self.render_preview() + tail, view=self)
-        except Exception:
-            pass
+        self._refresh_image_controls()
+        self._refresh_add_pictures_label()
+        await self._edit_preview(interaction, self._preview_header() + self.render_preview() + tail, self)
 
     @discord.ui.button(label="Remove Last", style=discord.ButtonStyle.gray, row=3)
     async def remove_last_picture(self, interaction: discord.Interaction, _):
@@ -1023,7 +1033,6 @@ class NotifyView(discord.ui.View):
         content = self.render_public()
         embeds, files = self._build_embeds_and_files()
 
-        # permission check (prevents “it posted but UI stuck” + surfaces perms)
         problem = _can_post(interaction.guild, self.channel, content, bool(files), bool(embeds))
         if problem:
             try:
@@ -1046,7 +1055,6 @@ class NotifyView(discord.ui.View):
                     allowed_mentions=discord.AllowedMentions.all(),
                 )  # type: ignore
 
-            # ✅ THIS is the main fix: update the ephemeral UI after success
             ch = getattr(self.channel, "mention", "the selected channel")
             try:
                 await interaction.edit_original_response(content=f"✅ Posted in {ch}.", view=None)
