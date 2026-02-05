@@ -602,7 +602,7 @@ class NotifyView(discord.ui.View):
         self._ping_select.callback = self._on_ping_mode
 
         self._role_select = discord.ui.RoleSelect(
-            placeholder="Role (only used if Role ping)",
+            placeholder="Role",
             min_values=0,
             max_values=1,
             row=2,
