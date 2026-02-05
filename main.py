@@ -1,4 +1,5 @@
 import os, time, sqlite3, io, asyncio, re
+
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -46,6 +47,12 @@ AUDIT_SLEEP_SECONDS = 1
 
 ANNOUNCE_CHANNEL_NAME = "📢announcements"
 
+# Notify picture upload window
+NOTIFY_IMAGE_WAIT_SECONDS = 60
+NOTIFY_MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8MB safety cap
+NOTIFY_MAX_IMAGES = 10  # Discord single-message attachment limit
+
+
 # -------------------------
 # /notify auto-bold list
 # -------------------------
@@ -91,11 +98,8 @@ AUTO_BOLD_PHRASES = [
     "Halies Port","Haka","Farsight Sector","Prasa","Pollux 31","Polaris Prime","Pherkad Secundus","Grand Errant",
 ]
 
+
 def auto_bold_phrases(text: str) -> str:
-    """
-    Bold phrases ONLY when they appear as standalone tokens (not embedded in other words).
-    Standalone definition: not immediately preceded/followed by [A-Za-z0-9_].
-    """
     if not text:
         return text
 
@@ -110,17 +114,49 @@ def auto_bold_phrases(text: str) -> str:
 
         def repl(m: re.Match) -> str:
             start, end = m.span(1)
-
-            # Skip if already bolded as **<match>**
             if start >= 2 and end + 2 <= len(text):
                 if text[start - 2:start] == "**" and text[end:end + 2] == "**":
                     return m.group(1)
-
             return f"**{m.group(1)}**"
 
         text = pattern.sub(repl, text)
 
     return text
+
+
+def _is_image_attachment(a: discord.Attachment) -> bool:
+    ct = (a.content_type or "").lower()
+    name = (a.filename or "").lower()
+    if ct.startswith("image/"):
+        return True
+    return name.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+
+
+def _safe_filename(name: str) -> str:
+    name = (name or "").strip() or "image.png"
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    if "." not in name:
+        name += ".png"
+    return name[:120]
+
+
+def _dedupe_filename(existing: set[str], desired: str) -> str:
+    if desired not in existing:
+        existing.add(desired)
+        return desired
+    base, dot, ext = desired.rpartition(".")
+    if not dot:
+        base, ext = desired, "png"
+    for i in range(2, 999):
+        cand = f"{base}_{i}.{ext}"
+        if cand not in existing:
+            existing.add(cand)
+            return cand
+    # last resort
+    cand = f"{base}_{int(time.time())}.{ext}"
+    existing.add(cand)
+    return cand
+
 
 # -------------------------
 # DISCORD
@@ -132,10 +168,11 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # -------------------------
-# GLOBAL LOCKS (fixes "database is locked")
+# GLOBAL LOCKS
 # -------------------------
 DB_LOCK = asyncio.Lock()
 _role_sync_tasks: dict[int, asyncio.Task] = {}
+
 
 # -------------------------
 # DB HELPERS
@@ -144,6 +181,7 @@ def now() -> int: return int(time.time())
 def minute_bucket(ts: int) -> int: return ts // 60
 def clamp_xp(x: int) -> int: return max(0, min(MAX_XP, int(x)))
 
+
 def db():
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
@@ -151,6 +189,7 @@ def db():
     c.execute("PRAGMA synchronous=NORMAL;")
     c.execute("PRAGMA busy_timeout=30000;")
     return c
+
 
 def init_db():
     with db() as c:
@@ -175,6 +214,7 @@ def init_db():
         """)
         c.commit()
 
+
 def get_user(c, gid: int, uid: int):
     r = c.execute("SELECT * FROM users WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
     if r:
@@ -183,12 +223,15 @@ def get_user(c, gid: int, uid: int):
     c.commit()
     return c.execute("SELECT * FROM users WHERE guild_id=? AND user_id=?", (gid, uid)).fetchone()
 
+
 def meta_get(c, key: str, default=None):
     r = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return r["value"] if r else default
 
+
 def meta_set(c, key: str, value):
     c.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
+
 
 def reset_audit_state(c, gid: int):
     c.execute("""
@@ -197,11 +240,14 @@ def reset_audit_state(c, gid: int):
         WHERE guild_id=?
     """, (gid,))
 
+
 def has_prime(m: discord.Member) -> bool:
     return any(r.name == MANUAL_PRIME_ROLE for r in m.roles)
 
+
 def is_admin(i: discord.Interaction) -> bool:
     return isinstance(i.user, discord.Member) and has_prime(i.user)
+
 
 async def fetch_members(guild: discord.Guild) -> dict[int, discord.Member]:
     out = {}
@@ -210,8 +256,10 @@ async def fetch_members(guild: discord.Guild) -> dict[int, discord.Member]:
             out[m.id] = m
     return out
 
+
 def get_announce_channel(guild: discord.Guild):
     return discord.utils.get(guild.text_channels, name=ANNOUNCE_CHANNEL_NAME)
+
 
 # -------------------------
 # XP CORE
@@ -234,6 +282,7 @@ def award_xp(c, gid: int, uid: int, amount: int, ts: int) -> int:
         WHERE guild_id=? AND user_id=?
     """, (clamp_xp(int(u["xp"]) + award), ts, bucket, earned + award, gid, uid))
     return award
+
 
 # -------------------------
 # RANKING (TOP-X)
@@ -264,8 +313,10 @@ def compute_rank_map(gid: int, member_ids: list[int]) -> dict[int, str]:
             out[uid] = ROLE_OPERATIVE
     return out
 
+
 def display_rank(m: discord.Member, computed: str) -> str:
     return f"{MANUAL_PRIME_ROLE} + {computed}" if has_prime(m) else computed
+
 
 # -------------------------
 # ROLE SYNC (DEBOUNCED)
@@ -282,6 +333,7 @@ async def request_role_sync(guild: discord.Guild):
             _role_sync_tasks.pop(guild.id, None)
 
     _role_sync_tasks[guild.id] = asyncio.create_task(runner())
+
 
 async def sync_all_roles(guild: discord.Guild):
     roles = {r.name: r for r in guild.roles}
@@ -307,6 +359,7 @@ async def sync_all_roles(guild: discord.Guild):
         except Exception:
             failed += 1
     return ok, failed
+
 
 # -------------------------
 # STARTUP AUDIT (SLOW + THROTTLED)
@@ -366,11 +419,13 @@ async def silent_startup_audit():
 
         await sync_all_roles(guild)
 
+
 # -------------------------
 # NOTIFY
 # -------------------------
 def _ping_label(mode: str) -> str:
     return {"here": "@here", "everyone": "@everyone", "role": "Role"}.get(mode, "No ping")
+
 
 class NotifyModal(discord.ui.Modal, title="Build Announcement"):
     def __init__(self, title_default: str = "", body_default: str = "", note_default: str = ""):
@@ -403,6 +458,7 @@ class NotifyModal(discord.ui.Modal, title="Build Announcement"):
         self.note_value = str(self.note_in.value).strip() if self.note_in.value else ""
         await interaction.response.defer(ephemeral=True)
 
+
 class EveryoneConfirmModal(discord.ui.Modal, title="Confirm DM @everyone"):
     def __init__(self):
         super().__init__()
@@ -418,11 +474,12 @@ class EveryoneConfirmModal(discord.ui.Modal, title="Confirm DM @everyone"):
         self.ok = (str(self.confirm_in.value).strip().upper() == "EVERYONE")
         await interaction.response.defer(ephemeral=True)
 
+
 class NotifyView(discord.ui.View):
-    def __init__(self, author_id: int, channel: discord.TextChannel, title: str, body: str, note: str = ""):
+    def __init__(self, author_id: int, channel: discord.abc.Messageable, title: str, body: str, note: str = ""):
         super().__init__(timeout=900)
         self.author_id = author_id
-        self.channel = channel
+        self.channel: discord.abc.Messageable = channel  # post destination
 
         self.title = title
         self.body = body
@@ -434,7 +491,10 @@ class NotifyView(discord.ui.View):
         self.dm_enabled = False
         self.dm_everyone_armed = False
 
-        self.preview_message: discord.Message | None = None
+        # multi-image: list of (bytes, filename)
+        self.images: list[tuple[bytes, str]] = []
+
+        self.waiting_for_image = False
 
         self._channel_select = discord.ui.ChannelSelect(
             placeholder="Post channel",
@@ -467,6 +527,7 @@ class NotifyView(discord.ui.View):
 
         self._dm_button = discord.ui.Button(label="DM pinged users: OFF", style=discord.ButtonStyle.secondary)
         self._dm_button.callback = self._toggle_dm
+        self.add_item(self._dm_button)
 
         self._apply_role_select_state()
         self._refresh_dm_button()
@@ -496,33 +557,54 @@ class NotifyView(discord.ui.View):
             return self.role is not None
         return False
 
+    def _images_line(self) -> str:
+        if not self.images:
+            return "🖼️ Images: *(none)*"
+        names = [fn for _, fn in self.images]
+        shown = ", ".join(f"**{n}**" for n in names[:5])
+        more = f" +{len(names)-5} more" if len(names) > 5 else ""
+        return f"🖼️ Images: **{len(names)}** — {shown}{more}"
+
     def render(self) -> str:
         ping = self._ping_text()
         title = auto_bold_phrases(self.title)
         body = auto_bold_phrases(self.body)
         note = auto_bold_phrases(self.note) if self.note else ""
+
         msg = f"{(ping + chr(10)) if ping else ''}# {title}\n{body}"
         if note:
             msg += f"\n-# {note}"
+        msg += f"\n\n{self._images_line()}"
         return msg
 
     def _preview_header(self) -> str:
         ping = _ping_label(self.ping_mode)
-        extra = f"\nChannel: {self.channel.mention} | Ping: **{ping}**"
+
+        ch_mention = "Unknown"
+        try:
+            ch_mention = getattr(self.channel, "mention", "Unknown")
+        except Exception:
+            pass
+
+        extra = f"\nChannel: {ch_mention} | Ping: **{ping}**"
         if self.ping_mode == "role" and self.role:
             extra += f" (**{self.role.name}**)"
         if self._dm_allowed():
             extra += f" | DM: **{'ON' if self.dm_enabled else 'OFF'}**"
-        return "📝 **Preview (private)** — Edit / Post / Cancel" + extra + "\n\n"
+        if self.waiting_for_image:
+            extra += " | 🖼️ **WAITING FOR IMAGE**"
+        return "📝 **Preview (private)** — Edit / Pictures / Post / Cancel" + extra + "\n\n"
 
     def _refresh_dm_button(self):
-        if self._dm_button in self.children:
-            self.remove_item(self._dm_button)
-
         if not self._dm_allowed():
             self.dm_enabled = False
             self.dm_everyone_armed = False
+            self._dm_button.disabled = True
+            self._dm_button.label = "DM pinged users: OFF"
+            self._dm_button.style = discord.ButtonStyle.secondary
             return
+
+        self._dm_button.disabled = False
 
         if self.ping_mode == "everyone":
             self._dm_button.label = f"DM @everyone: {'ON' if self.dm_enabled else 'OFF'}"
@@ -530,8 +612,6 @@ class NotifyView(discord.ui.View):
         else:
             self._dm_button.label = f"DM role: {'ON' if self.dm_enabled else 'OFF'}"
             self._dm_button.style = discord.ButtonStyle.success if self.dm_enabled else discord.ButtonStyle.secondary
-
-        self.add_item(self._dm_button)
 
     async def _rerender(self, interaction: discord.Interaction):
         self._apply_role_select_state()
@@ -555,7 +635,7 @@ class NotifyView(discord.ui.View):
                 resolved = None
 
         if resolved is not None and hasattr(resolved, "send"):
-            self.channel = resolved
+            self.channel = resolved  # type: ignore
 
         await self._rerender(interaction)
 
@@ -577,12 +657,14 @@ class NotifyView(discord.ui.View):
 
     async def _toggle_dm(self, interaction: discord.Interaction):
         if not self._dm_allowed():
-            return await interaction.response.send_message(
-                "DM is only available for @everyone or Role ping.", ephemeral=True
-            )
+            return await self._rerender(interaction)
 
         if not self._dm_audience_ok():
-            return await interaction.response.send_message("Pick a role first (Role ping).", ephemeral=True)
+            try:
+                await interaction.response.send_message("Pick a role first (Role ping).", ephemeral=True)
+            except Exception:
+                pass
+            return
 
         if self.dm_enabled:
             self.dm_enabled = False
@@ -594,13 +676,16 @@ class NotifyView(discord.ui.View):
             await interaction.response.send_modal(modal)
             await modal.wait()
             if not modal.ok:
+                try:
+                    await interaction.followup.send("❌ Cancelled DM @everyone.", ephemeral=True)
+                except Exception:
+                    pass
                 return
 
             self.dm_everyone_armed = True
             self.dm_enabled = True
             try:
-                if self.preview_message:
-                    await self.preview_message.edit(content=self._preview_header() + self.render(), view=self)
+                await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
             except Exception:
                 pass
             return
@@ -618,25 +703,116 @@ class NotifyView(discord.ui.View):
             return [m for m in ms if (not m.bot and self.role in m.roles)]
         return []
 
-    async def _send_dms(self, guild: discord.Guild, content: str) -> tuple[int, int]:
+    def _build_embeds_and_files(self) -> tuple[list[discord.Embed], list[discord.File]]:
+        if not self.images:
+            return [], []
+
+        embeds: list[discord.Embed] = []
+        files: list[discord.File] = []
+
+        for data, filename in self.images[:NOTIFY_MAX_IMAGES]:
+            f = discord.File(fp=io.BytesIO(data), filename=filename)
+            files.append(f)
+            e = discord.Embed()
+            e.set_image(url=f"attachment://{filename}")
+            embeds.append(e)
+
+        return embeds, files
+
+    async def _send_dms(self, guild: discord.Guild, content: str, embeds: list[discord.Embed]) -> tuple[int, int]:
         sent = failed = 0
         targets = await self._dm_targets(guild)
+
         for m in targets:
             try:
-                await m.send(content)
+                # rebuild files for each DM (files get consumed)
+                files: list[discord.File] = []
+                if self.images:
+                    for data, filename in self.images[:NOTIFY_MAX_IMAGES]:
+                        files.append(discord.File(fp=io.BytesIO(data), filename=filename))
+
+                if files and embeds:
+                    await m.send(content, embeds=embeds, files=files)
+                elif embeds:
+                    await m.send(content, embeds=embeds)
+                else:
+                    await m.send(content)
+
                 sent += 1
             except Exception:
                 failed += 1
+
             await asyncio.sleep(0.6)
+
         return sent, failed
 
-    @discord.ui.button(label="Edit", style=discord.ButtonStyle.blurple)
+    async def _wait_for_image_message(self, channel: discord.abc.Messageable, author_id: int) -> discord.Message | None:
+        def check(m: discord.Message) -> bool:
+            if m.author.id != author_id:
+                return False
+            if m.channel.id != getattr(channel, "id", None):
+                return False
+            if not m.attachments:
+                return False
+            return any(_is_image_attachment(a) for a in m.attachments)
+
+        try:
+            msg = await bot.wait_for("message", timeout=NOTIFY_IMAGE_WAIT_SECONDS, check=check)
+            return msg
+        except asyncio.TimeoutError:
+            return None
+
+    async def _append_images_from_message(self, msg: discord.Message) -> tuple[bool, str]:
+        imgs = [a for a in msg.attachments if _is_image_attachment(a)]
+        if not imgs:
+            return False, "No image attachment found."
+
+        if len(self.images) >= NOTIFY_MAX_IMAGES:
+            return False, f"Already at max images ({NOTIFY_MAX_IMAGES})."
+
+        added = 0
+        names_used = {fn for _, fn in self.images}
+
+        for a in imgs:
+            if len(self.images) >= NOTIFY_MAX_IMAGES:
+                break
+
+            if a.size and a.size > NOTIFY_MAX_IMAGE_BYTES:
+                continue
+
+            try:
+                data = await a.read()
+            except Exception:
+                continue
+
+            if len(data) > NOTIFY_MAX_IMAGE_BYTES:
+                continue
+
+            desired = _safe_filename(a.filename or "image.png")
+            filename = _dedupe_filename(names_used, desired)
+
+            self.images.append((data, filename))
+            added += 1
+
+        if added == 0:
+            return False, "No valid images added (type/size?)."
+
+        if len(imgs) > added:
+            return True, f"Added {added} image(s). Some were skipped (limit/size)."
+
+        return True, f"Added {added} image(s)."
+
+    @discord.ui.button(label="Edit", style=discord.ButtonStyle.blurple, row=3)
     async def edit(self, interaction: discord.Interaction, _):
         modal = NotifyModal(self.title, self.body, self.note)
         await interaction.response.send_modal(modal)
         await modal.wait()
 
         if not modal.title_value or not modal.body_value:
+            try:
+                await interaction.followup.send("❌ Title/Body required.", ephemeral=True)
+            except Exception:
+                pass
             return
 
         self.title = modal.title_value
@@ -644,12 +820,77 @@ class NotifyView(discord.ui.View):
         self.note = modal.note_value
 
         try:
-            if self.preview_message:
-                await self.preview_message.edit(content=self._preview_header() + self.render(), view=self)
+            await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
         except Exception:
             pass
 
-    @discord.ui.button(label="Post", style=discord.ButtonStyle.green)
+    @discord.ui.button(label="Add Picture(s)", style=discord.ButtonStyle.secondary, row=3)
+    async def add_pictures(self, interaction: discord.Interaction, _):
+        if self.waiting_for_image:
+            return await self._rerender(interaction)
+
+        if len(self.images) >= NOTIFY_MAX_IMAGES:
+            return await interaction.response.send_message(
+                f"Already at max images ({NOTIFY_MAX_IMAGES}).", ephemeral=True
+            )
+
+        self.waiting_for_image = True
+        await self._rerender(interaction)
+
+        channel = interaction.channel
+        if channel is None:
+            self.waiting_for_image = False
+            try:
+                await interaction.message.edit(content=self._preview_header() + self.render(), view=self)
+            except Exception:
+                pass
+            return
+
+        msg = await self._wait_for_image_message(channel, interaction.user.id)
+        if msg is None:
+            self.waiting_for_image = False
+            try:
+                await interaction.message.edit(
+                    content=self._preview_header() + self.render() + "\n\n⏱️ *(Image upload timed out.)*",
+                    view=self,
+                )
+            except Exception:
+                pass
+            return
+
+        ok, note = await self._append_images_from_message(msg)
+
+        # delete the user's upload message so nothing lingers
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+        self.waiting_for_image = False
+        tail = ""
+        if not ok:
+            tail = f"\n\n❌ *{note}*"
+        else:
+            # no extra message spam; just a small inline note once
+            tail = f"\n\n✅ *{note}*"
+
+        try:
+            await interaction.message.edit(content=self._preview_header() + self.render() + tail, view=self)
+        except Exception:
+            pass
+
+    @discord.ui.button(label="Remove Last", style=discord.ButtonStyle.gray, row=3)
+    async def remove_last_picture(self, interaction: discord.Interaction, _):
+        if self.images:
+            self.images.pop()
+        await self._rerender(interaction)
+
+    @discord.ui.button(label="Clear Pictures", style=discord.ButtonStyle.gray, row=3)
+    async def clear_pictures(self, interaction: discord.Interaction, _):
+        self.images.clear()
+        await self._rerender(interaction)
+
+    @discord.ui.button(label="Post", style=discord.ButtonStyle.green, row=4)
     async def post(self, interaction: discord.Interaction, _):
         if not interaction.guild:
             return await interaction.response.send_message("Guild only.", ephemeral=True)
@@ -659,38 +900,61 @@ class NotifyView(discord.ui.View):
             await interaction.response.send_modal(modal)
             await modal.wait()
             if not modal.ok:
+                try:
+                    await interaction.followup.send("❌ Post cancelled (DM @everyone not confirmed).", ephemeral=True)
+                except Exception:
+                    pass
                 return
 
-        me = interaction.guild.me
-        if me and hasattr(self.channel, "permissions_for"):
-            perms = self.channel.permissions_for(me)
-            if not perms.send_messages:
-                return await interaction.response.send_message(
-                    f"❌ I can't post in {self.channel.mention} (missing Send Messages).",
-                    ephemeral=True,
-                )
-
-        content = self.render()
-
+        # acknowledge click instantly (prevents "interaction failed")
         try:
-            # The only message that should remain: the posted announcement (public)
-            await self.channel.send(content, allowed_mentions=discord.AllowedMentions.all())
-
-            if self.dm_enabled:
-                await self._send_dms(interaction.guild, content)
-
-            # Kill the preview UI by editing the same ephemeral message + removing view
-            await interaction.response.edit_message(content="✅ Posted.", view=None)
-
-        except Exception as e:
+            await interaction.response.edit_message(content="⏳ Posting…", view=None)
+        except Exception:
             try:
-                await interaction.response.send_message(f"❌ Failed: `{e}`", ephemeral=True)
+                await interaction.followup.send("⏳ Posting…", ephemeral=True)
             except Exception:
                 pass
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.gray)
+        content = self.render()
+        embeds, files = self._build_embeds_and_files()
+
+        try:
+            if files and embeds:
+                await self.channel.send(
+                    content,
+                    embeds=embeds,
+                    files=files,
+                    allowed_mentions=discord.AllowedMentions.all(),
+                )  # type: ignore
+            else:
+                await self.channel.send(
+                    content,
+                    allowed_mentions=discord.AllowedMentions.all(),
+                )  # type: ignore
+
+            if self.dm_enabled:
+                sent, failed = await self._send_dms(interaction.guild, content, embeds)
+                try:
+                    await interaction.followup.send(f"DMs: {sent} sent, {failed} failed", ephemeral=True)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            try:
+                await interaction.followup.send(f"❌ Failed: `{e}`", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red, row=4)
     async def cancel(self, interaction: discord.Interaction, _):
-        await interaction.response.edit_message(content="Cancelled.", view=None)
+        try:
+            await interaction.response.edit_message(content="Cancelled.", view=None)
+        except Exception:
+            try:
+                await interaction.followup.send("Cancelled.", ephemeral=True)
+            except Exception:
+                pass
+
 
 @bot.tree.command(name="notify")
 async def notify(interaction: discord.Interaction):
@@ -715,13 +979,12 @@ async def notify(interaction: discord.Interaction):
         return
 
     view = NotifyView(interaction.user.id, default_channel, modal.title_value, modal.body_value, modal.note_value)
-
-    msg = await interaction.followup.send(
+    await interaction.followup.send(
         view._preview_header() + view.render(),
         view=view,
         ephemeral=True,
     )
-    view.preview_message = msg
+
 
 # -------------------------
 # EVENTS
@@ -736,6 +999,7 @@ async def on_ready():
         vc_xp_loop.start()
     await silent_startup_audit()
     print("Ready:", bot.user)
+
 
 @bot.event
 async def on_message(msg: discord.Message):
@@ -762,6 +1026,7 @@ async def on_message(msg: discord.Message):
 
     if gained:
         await request_role_sync(msg.guild)
+
 
 # -------------------------
 # VC XP (1 XP per 5 minutes)
@@ -801,6 +1066,7 @@ async def vc_xp_loop():
         if any_gain:
             await request_role_sync(guild)
 
+
 # -------------------------
 # DECAY
 # -------------------------
@@ -838,6 +1104,7 @@ async def decay_loop():
 
         if changed:
             await request_role_sync(guild)
+
 
 # -------------------------
 # COMMANDS
@@ -882,6 +1149,7 @@ async def standing(interaction: discord.Interaction):
         ephemeral=True,
     )
 
+
 @bot.tree.command(name="leaderboard")
 @app_commands.describe(announce="Post publicly")
 async def leaderboard(interaction: discord.Interaction, announce: bool = False):
@@ -923,6 +1191,7 @@ async def leaderboard(interaction: discord.Interaction, announce: bool = False):
 
     await interaction.followup.send("✅ Leaderboard\n" + preview, ephemeral=not announce)
     await interaction.followup.send(file=file, ephemeral=not announce)
+
 
 @bot.tree.command(name="audit")
 @app_commands.describe(days="Days back", announce="Post publicly")
@@ -990,6 +1259,7 @@ async def audit(interaction: discord.Interaction, days: int = 30, announce: bool
         ephemeral=not announce,
     )
 
+
 @bot.tree.command(name="resetranks")
 @app_commands.describe(member="Optional single member")
 async def resetranks(interaction: discord.Interaction, member: discord.Member | None = None):
@@ -1028,6 +1298,7 @@ async def resetranks(interaction: discord.Interaction, member: discord.Member | 
         ephemeral=True,
     )
 
+
 @bot.tree.command(name="setxp")
 @app_commands.describe(member="User", xp="New XP", announce="Public?")
 async def setxp(interaction: discord.Interaction, member: discord.Member, xp: int, announce: bool = False):
@@ -1056,6 +1327,7 @@ async def setxp(interaction: discord.Interaction, member: discord.Member, xp: in
         ephemeral=not announce,
     )
 
+
 # -------------------------
 # RUN
 # -------------------------
@@ -1063,6 +1335,3 @@ token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise RuntimeError("DISCORD_TOKEN missing")
 bot.run(token)
-
-
-
