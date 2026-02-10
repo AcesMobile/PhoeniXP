@@ -35,14 +35,15 @@ ROLE_EMBER = "Ember"
 ROLE_ASCENDANT = "Ascendant"
 ROLE_NAMES = [ROLE_INITIATE, ROLE_OPERATIVE, ROLE_EMBER, ROLE_ASCENDANT]
 
-MANUAL_PRIME_ROLE = "Phoenix Prime"  # primes are admins
+# ✅ primes are admins (any of these roles grant admin powers)
+MANUAL_PRIME_ROLES = {"Phoenix Prime", "MIDNIGHT DEV TEAM"}
 
 # ✅ Persist DB on Railway volume (mount volume to /app/data)
 DB_PATH = os.getenv("XP_DB_PATH", "/app/data/xp.db")
 
 ROLE_SYNC_DEBOUNCE_SECONDS = 20
 
-STARTUP_AUDIT_DAYS = 365
+# /audit throttling
 AUDIT_SLEEP_EVERY_MSGS = 250
 AUDIT_SLEEP_SECONDS = 1
 
@@ -279,7 +280,8 @@ def reset_audit_state(c: sqlite3.Connection, gid: int):
 
 
 def has_prime(m: discord.Member) -> bool:
-    return any(r.name == MANUAL_PRIME_ROLE for r in m.roles)
+    role_names = {r.name for r in m.roles}
+    return any(name in role_names for name in MANUAL_PRIME_ROLES)
 
 
 def is_admin(i: discord.Interaction) -> bool:
@@ -358,7 +360,7 @@ def compute_rank_map(gid: int, member_ids: list[int]) -> dict[int, str]:
 
 
 def display_rank(m: discord.Member, computed: str) -> str:
-    return f"{MANUAL_PRIME_ROLE} + {computed}" if has_prime(m) else computed
+    return f"Prime + {computed}" if has_prime(m) else computed
 
 
 # -------------------------
@@ -422,72 +424,6 @@ async def sync_all_roles(guild: discord.Guild):
             await asyncio.sleep(ROLE_SYNC_SLEEP_SECONDS)
 
     return ok, failed
-
-
-# -------------------------
-# STARTUP AUDIT (SLOW + THROTTLED)
-# -------------------------
-async def silent_startup_audit():
-    for guild in bot.guilds:
-        key = f"startup_audit_done:{guild.id}"
-
-        async with DB_LOCK:
-            with db() as c:
-                if meta_get(c, key) == "1":
-                    continue
-                meta_set(c, key, "1")
-                reset_audit_state(c, guild.id)
-                c.commit()
-
-        cutoff = datetime.now(timezone.utc) - timedelta(days=STARTUP_AUDIT_DAYS)
-        throttle = 0
-
-        async with DB_LOCK:
-            with db() as c:
-                try:
-                    members = await fetch_members(guild)
-                    ensure_users_exist(c, guild.id, list(members.keys()))
-                    c.commit()
-                except Exception:
-                    pass
-
-                for ch in guild.text_channels:
-                    me = guild.me
-                    if not me:
-                        continue
-                    perms = ch.permissions_for(me)
-                    if not perms.view_channel or not perms.read_message_history:
-                        continue
-
-                    try:
-                        async for msg in ch.history(after=cutoff, oldest_first=True, limit=None):
-                            if msg.author.bot:
-                                continue
-                            if len((msg.content or "").strip()) < MIN_MESSAGE_CHARS:
-                                continue
-
-                            ts = int(msg.created_at.timestamp())
-                            u = get_user(c, guild.id, msg.author.id)
-                            if ts < int(u["chat_cooldown"]):
-                                continue
-
-                            gained = award_xp(c, guild.id, msg.author.id, CHAT_XP_PER_TICK, ts)
-                            if gained:
-                                c.execute(
-                                    "UPDATE users SET chat_cooldown=? WHERE guild_id=? AND user_id=?",
-                                    (ts + CHAT_COOLDOWN_SECONDS, guild.id, msg.author.id),
-                                )
-
-                            throttle += 1
-                            if throttle % AUDIT_SLEEP_EVERY_MSGS == 0:
-                                c.commit()
-                                await asyncio.sleep(AUDIT_SLEEP_SECONDS)
-                    except Exception:
-                        pass
-
-                c.commit()
-
-        await sync_all_roles(guild)
 
 
 # -------------------------
@@ -1107,7 +1043,7 @@ async def notify(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
     if not is_admin(interaction):
-        return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
+        return await interaction.response.send_message("Prime only.", ephemeral=True)
 
     default_channel = get_announce_channel(interaction.guild)
     if default_channel is None and isinstance(interaction.channel, discord.TextChannel):
@@ -1143,9 +1079,6 @@ async def on_ready():
         decay_loop.start()
     if not vc_xp_loop.is_running():
         vc_xp_loop.start()
-
-    # ❌ Disabled: startup audit can "recreate" XP from only recent history on fresh DB
-    # bot.loop.create_task(silent_startup_audit())
 
     print("Ready:", bot.user)
 
@@ -1353,7 +1286,7 @@ async def audit(interaction: discord.Interaction, days: int = 30, announce: bool
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
     if not is_admin(interaction):
-        return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
+        return await interaction.response.send_message("Prime only.", ephemeral=True)
 
     guild = interaction.guild
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -1420,7 +1353,7 @@ async def resetranks(interaction: discord.Interaction, member: discord.Member | 
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
     if not is_admin(interaction):
-        return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
+        return await interaction.response.send_message("Prime only.", ephemeral=True)
 
     guild = interaction.guild
     await interaction.response.defer(ephemeral=True)
@@ -1460,7 +1393,7 @@ async def setxp(interaction: discord.Interaction, member: discord.Member, xp: in
     if not interaction.guild:
         return await interaction.response.send_message("Guild only.", ephemeral=True)
     if not is_admin(interaction):
-        return await interaction.response.send_message("Phoenix Prime only.", ephemeral=True)
+        return await interaction.response.send_message("Prime only.", ephemeral=True)
 
     xp = clamp_xp(xp)
     await interaction.response.defer(ephemeral=not announce)
