@@ -1168,7 +1168,7 @@ def _poll_time_left_text(ends_at: int) -> str:
 def _poll_render_active(question: str, options: list[str], ends_at: int) -> str:
     q = auto_bold_phrases(question)
     lines = [f"🗳️ **POLL**", f"**{q}**", "", "*(Anonymous voting — results hidden until the poll ends. No vote changes.)*"]
-    lines.append(f"⏳ Time left: **{_poll_time_left_text(ends_at)}**")
+    lines.append(f"⏳ Poll lasts: **{_poll_time_left_text(ends_at)}**")
     lines.append("")
     for i, opt in enumerate(options, start=1):
         lines.append(f"{i}. {auto_bold_phrases(opt)}")
